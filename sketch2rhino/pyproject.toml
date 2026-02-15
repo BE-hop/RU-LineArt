@@ -1,0 +1,32 @@
+[project]
+name = "sketch2rhino"
+version = "0.1.0"
+description = "Convert planar sketch line image to one open NURBS curve in Rhino (.3dm)"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "numpy>=1.26,<2.0",
+  "opencv-python>=4.8,<4.13",
+  "scikit-image>=0.22,<0.25",
+  "scipy>=1.11,<1.14",
+  "rhino3dm>=8.0.0",
+  "pyyaml>=6.0",
+  "pydantic>=2.0",
+  "typer>=0.12",
+  "rich>=13.0",
+  "matplotlib>=3.8"
+]
+
+[project.scripts]
+sketch2rhino = "sketch2rhino.cli:app"
+
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+addopts = "-q"

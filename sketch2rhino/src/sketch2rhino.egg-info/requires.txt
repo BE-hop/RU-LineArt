@@ -1,0 +1,10 @@
+numpy<2.0,>=1.26
+opencv-python<4.13,>=4.8
+scikit-image<0.25,>=0.22
+scipy<1.14,>=1.11
+rhino3dm>=8.0.0
+pyyaml>=6.0
+pydantic>=2.0
+typer>=0.12
+rich>=13.0
+matplotlib>=3.8

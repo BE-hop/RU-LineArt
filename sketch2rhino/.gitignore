@@ -1,0 +1,11 @@
+.venv/
+__pycache__/
+.pytest_cache/
+*.pyc
+*.pyo
+*.pyd
+*.swp
+.DS_Store
+
+data/outputs/*
+!data/outputs/.gitkeep

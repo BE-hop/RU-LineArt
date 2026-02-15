@@ -1,0 +1,1 @@
+"""Vision stage: preprocess + skeletonization."""

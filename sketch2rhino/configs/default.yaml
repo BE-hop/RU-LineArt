@@ -1,0 +1,51 @@
+preprocess:
+  target_black_on_white: true
+  denoise:
+    enable: false
+    method: "gaussian"   # or "bilateral"
+    strength: 1.0
+  binarize:
+    method: "otsu"    # or "adaptive"
+    block_size: 31
+    C: 7
+  morph:
+    close_iter: 0
+    open_iter: 0
+
+skeleton:
+  prune_spurs: true
+  spur_min_length_px: 18
+
+path_extract:
+  mode: "main_open_path"
+  crossing_policy: "overpass"
+  choose_component: "all"   # "largest" or "all"
+  loop_cut: "min_curvature"   # or "leftmost", "topmost"
+
+fit:
+  degree: 3
+  max_control_points: 50
+  simplify:
+    method: "rdp"       # Ramer-Douglas-Peucker
+    epsilon_px: 1.5
+    smooth_enable: true
+    smooth_window: 5
+    smooth_passes: 1
+  spline:
+    smoothing: 0.0      # start with interpolation; fallback handles unstable fits
+    max_iter: 5
+    fallback_if_fail: true
+
+export:
+  plane: "XY"
+  layer_name: "sketch_curve"
+  object_name: "main_nurbs"
+  multi_object_prefix: "stroke"
+
+output:
+  mode: "multi"   # "single" or "multi"
+  multi:
+    min_length_px: 20
+    max_curves: 50
+    include_loops: true
+    sort_by: "length"

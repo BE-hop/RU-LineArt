@@ -1,0 +1,124 @@
+Metadata-Version: 2.4
+Name: sketch2rhino
+Version: 0.1.0
+Summary: Convert planar sketch line image to one open NURBS curve in Rhino (.3dm)
+Requires-Python: >=3.11
+Description-Content-Type: text/markdown
+Requires-Dist: numpy<2.0,>=1.26
+Requires-Dist: opencv-python<4.13,>=4.8
+Requires-Dist: scikit-image<0.25,>=0.22
+Requires-Dist: scipy<1.14,>=1.11
+Requires-Dist: rhino3dm>=8.0.0
+Requires-Dist: pyyaml>=6.0
+Requires-Dist: pydantic>=2.0
+Requires-Dist: typer>=0.12
+Requires-Dist: rich>=13.0
+Requires-Dist: matplotlib>=3.8
+
+# sketch2rhino
+
+A local tool that converts a **single-line planar sketch image** into **one editable open NURBS curve** in Rhino.
+
+## What it does
+Input:
+- A sketch image containing **one main contour stroke** (can be jittery, messy, varying thickness).
+- Crossings are treated as **overpasses** (not connected).
+
+Output:
+- A `.3dm` file containing **exactly one open NURBS curve**, editable in Rhino.
+- Optional debug artifacts (binarized image, skeleton, extracted path overlay).
+
+## Design constraints (fixed for MVP)
+- ✅ Planar only (outputs curve in XY plane).
+- ✅ No scale calibration (you can scale in Rhino).
+- ✅ No text/semantic hints.
+- ✅ Fully automatic (no user interaction).
+- ✅ Output is one open curve; not required to be closed.
+- ✅ Control points upper bound: 50 (best effort).
+
+## Quick start
+
+### 1) Create environment (Python 3.11+ recommended)
+
+Using venv:
+```bash
+python -m venv .venv
+source .venv/bin/activate  # macOS/Linux
+# .venv\\Scripts\\activate   # Windows PowerShell
+pip install -U pip
+pip install -e .
+```
+
+### 2) Run
+
+```bash
+sketch2rhino run \
+  --image data/samples/sample.png \
+  --out   data/outputs/sample.3dm \
+  --config configs/default.yaml \
+  --debug data/outputs/debug_sample
+```
+
+Included clean samples:
+- `data/samples/sample_straight.png`
+- `data/samples/sample_curve.png`
+- `data/samples/sample_crossing.png`
+
+## CLI
+
+```bash
+sketch2rhino run --image <path> --out <path.3dm> [--config <yaml>] [--debug <dir>]
+```
+
+## Pipeline overview
+
+1. Preprocess:
+- denoise / contrast
+- binarize (black strokes on white)
+- morphological cleanup
+
+2. Skeletonize:
+- convert thick strokes into 1-pixel-wide skeleton
+
+3. Graph + main path:
+- build a pixel graph from skeleton
+- remove tiny spurs
+- extract **one main open path** (crossings are overpasses)
+
+4. Fit:
+- simplify polyline
+- fit an open B-spline / NURBS with control points ≤ 50 (best-effort)
+
+5. Export:
+- write `.3dm` using `rhino3dm`
+
+## Debug outputs
+
+If `--debug` is provided, the tool saves:
+
+- `01_binarized.png`
+- `02_skeleton.png`
+- `03_path_overlay.png`
+- `04_polyline.json`
+- `05_nurbs.json`
+- `report.json` (timings, counts, warnings)
+
+## Known limitations
+
+- If the input has multiple disjoint strokes, the tool selects the largest/main component.
+- If the sketch is extremely tangled, the extracted main path may deviate.
+- 3D perspective sketches are treated as 2D projections.
+
+## Development
+
+Run tests:
+
+```bash
+pytest -q
+```
+
+## Roadmap ideas (optional)
+
+- Better crossing disentanglement
+- Robust main-path selection (closed-loop handling)
+- Optional interactive correction

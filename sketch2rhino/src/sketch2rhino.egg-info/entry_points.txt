@@ -1,0 +1,2 @@
+[console_scripts]
+sketch2rhino = sketch2rhino.cli:app
