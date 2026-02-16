@@ -1,11 +1,11 @@
 # sketch2rhino
 
-A local tool that converts a **single-line planar sketch image** into **one editable open NURBS curve** in Rhino.
+A local tool that converts a planar sketch image into one or more editable open NURBS curves in Rhino.
 
 ## What it does
 Input:
-- A sketch image containing **one main contour stroke** (can be jittery, messy, varying thickness).
-- Crossings are treated as **overpasses** (not connected).
+- A sketch image containing one or more contour strokes (can be jittery, messy, varying thickness).
+- Crossings are treated as overpasses (not connected), with topology-preserving pairing in multi mode.
 
 Output:
 - A `.3dm` file containing one or more open NURBS curves (mode-dependent), editable in Rhino.
@@ -66,6 +66,8 @@ Multi-mode controls:
 - `output.multi.max_curves`: cap number of exported curves.
 - `output.multi.include_loops`: if true, closed loops are cut open and exported.
 - `output.multi.sort_by`: currently supports `length`.
+- `output.multi.preserve_junctions`: keep detected junction anchors in simplification/fitting.
+- `output.multi.junction_snap_radius_px`: snap nearby stroke points to the same junction anchor.
 
 For multi-mode across disjoint parts, keep:
 
@@ -74,6 +76,29 @@ For multi-mode across disjoint parts, keep:
 To force legacy single-component behavior, set:
 
 - `path_extract.choose_component: "largest"`
+
+Crossing-focused extraction controls:
+
+- `path_extract.cluster_radius_px`: groups nearby junction pixels into one stable node.
+- `path_extract.junction_bridge_max_px`: merges split junction clusters connected by a short bridge.
+- `path_extract.tangent_k`: tangent sampling distance used for direction pairing at junctions.
+
+Recommended smoothing-first defaults (already reflected in `configs/default.yaml`):
+
+- `fit.simplify.epsilon_px: 1.2`
+- `fit.simplify.smooth_enable: false`
+- `fit.simplify.smooth_window: 7`
+- `fit.simplify.smooth_passes: 1`
+- `fit.spline.smoothing: 6.0`
+- `output.multi.junction_snap_radius_px: 3.0`
+- `fit.spline.anchor_correction_enable: true`
+- `fit.spline.anchor_tolerance_px: 2.0`
+- `fit.spline.anchor_snap_max_dist_px: 10.0`
+- `fit.spline.anchor_weight: 20.0`
+
+If curve shape becomes too loose, reduce `fit.spline.smoothing` first (e.g. `6 -> 3`).
+If curves become too jagged, increase `fit.spline.smoothing` slightly (e.g. `6 -> 10`).
+If crossings drift apart, increase `fit.spline.anchor_weight` (e.g. `20 -> 28`).
 
 ## Safe Environment Workflow (Important)
 
@@ -107,7 +132,8 @@ If `pytest` resolves to something like `/opt/anaconda3/bin/pytest`, you are not 
 3. Graph + main path:
 - build a pixel graph from skeleton
 - remove tiny spurs
-- extract **one main open path** (crossings are overpasses)
+- build a junction-clustered super-graph and extract stroke paths (single or multi mode)
+- crossings are treated as overpasses using direction-based continuation pairing
 
 4. Fit:
 - simplify polyline
@@ -129,9 +155,22 @@ If `--debug` is provided, the tool saves:
 
 ## Known limitations
 
-- If the input has multiple disjoint strokes, the tool selects the largest/main component.
-- If the sketch is extremely tangled, the extracted main path may deviate.
+- Very dense tangles can still create small extra fragments; raise `output.multi.min_length_px` to filter them.
+- Extremely close parallel strokes may still merge during skeletonization at low resolution.
 - 3D perspective sketches are treated as 2D projections.
+
+## Topology-Preserving Strategy (Current Default)
+
+For crossing-heavy clean line art, extraction follows:
+
+1. Skeleton -> pixel graph.
+2. Junction clustering (`cluster_radius_px`) + short-bridge merge (`junction_bridge_max_px`).
+3. Keep parallel super-edges (important: do not collapse distinct stroke branches).
+4. At each junction, pair incident edges by best straight-through direction continuity.
+5. Trace open strokes from endpoints.
+6. Preserve/snap junction anchors during simplification and fitting.
+
+This is the recommended baseline when you want results similar to red/green stroke overlays in debug images.
 
 ## Development
 
@@ -174,6 +213,23 @@ This warning is non-fatal for this project. If you want to silence it:
 mkdir -p .tmp/mplconfig
 export MPLCONFIGDIR="$(pwd)/.tmp/mplconfig"
 ```
+
+### Why control points look like "one above, one below"
+
+In NURBS, control points define a control polygon and are not expected to lie on the curve centerline.
+Alternating control-point positions can be normal.
+
+If the final curve itself drifts locally (not just the control polygon), common causes are:
+
+- over-constrained duplicate junction anchors around one crossing area
+- over-smoothed fitting (`fit.spline.smoothing` too high)
+- too-weak simplification causing pixel-zigzag to leak into fitting
+
+Current pipeline mitigations:
+
+- junction anchors come from the same super-graph used for stroke extraction
+- near-duplicate anchors are merged before fitting
+- `report.json` includes `anchor_error_px` for quantitative checks
 
 ## Roadmap ideas (optional)
 

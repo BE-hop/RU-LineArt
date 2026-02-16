@@ -40,20 +40,30 @@ class PathExtractConfig(BaseModel):
     crossing_policy: str = "overpass"
     choose_component: str = "largest"
     loop_cut: str = "min_curvature"
+    cluster_radius_px: float = 4.0
+    junction_bridge_max_px: float = 12.0
+    tangent_k: int = 10
 
 
 class SimplifyConfig(BaseModel):
     method: str = "rdp"
-    epsilon_px: float = 1.5
-    smooth_enable: bool = True
-    smooth_window: int = 5
+    epsilon_px: float = 1.2
+    smooth_enable: bool = False
+    smooth_window: int = 7
     smooth_passes: int = 1
 
 
 class SplineConfig(BaseModel):
-    smoothing: float = 0.0
-    max_iter: int = 5
+    smoothing: float = 6.0
+    max_iter: int = 6
     fallback_if_fail: bool = True
+    anchor_correction_enable: bool = True
+    anchor_tolerance_px: float = 2.0
+    anchor_snap_max_dist_px: float = 10.0
+    anchor_weight: float = 20.0
+    anchor_neighbor_weight: float = 6.0
+    anchor_refit_max_iter: int = 2
+    anchor_sample_count: int = 400
 
 
 class FitConfig(BaseModel):
@@ -75,6 +85,8 @@ class MultiOutputConfig(BaseModel):
     max_curves: int = 50
     include_loops: bool = True
     sort_by: str = "length"
+    preserve_junctions: bool = True
+    junction_snap_radius_px: float = 4.0
 
 
 class OutputConfig(BaseModel):

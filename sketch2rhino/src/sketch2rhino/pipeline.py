@@ -4,6 +4,7 @@ from pathlib import Path
 from time import perf_counter
 
 import numpy as np
+from scipy.interpolate import BSpline
 
 from sketch2rhino.config import AppConfig
 from sketch2rhino.debug.artifacts import (
@@ -21,6 +22,7 @@ from sketch2rhino.fit.polyline_simplify import simplify_polyline
 from sketch2rhino.topo.graph_build import build_stroke_graph
 from sketch2rhino.topo.path_extract import (
     choose_main_component,
+    extract_junction_centers,
     extract_main_open_path,
     extract_open_paths,
     split_components,
@@ -29,12 +31,112 @@ from sketch2rhino.types import ExportResult, NurbsSpec, Polyline2D
 from sketch2rhino.vision.preprocess import load_grayscale_image, preprocess_image
 from sketch2rhino.vision.skeletonize import skeletonize_image
 
-
 def _polyline_length(polyline: Polyline2D) -> float:
     arr = polyline.as_array()
     if len(arr) < 2:
         return 0.0
     return float(np.linalg.norm(np.diff(arr, axis=0), axis=1).sum())
+
+
+def _snap_and_collect_protected_points(
+    polylines: list[Polyline2D],
+    junctions_xy: list[tuple[float, float]],
+    snap_radius: float,
+) -> tuple[list[Polyline2D], list[list[tuple[float, float]]]]:
+    if not polylines:
+        return polylines, []
+
+    arrays = [pl.as_array().copy() for pl in polylines]
+    protected: list[list[tuple[float, float]]] = [[] for _ in polylines]
+    radius = max(0.5, float(snap_radius))
+
+    for jx, jy in junctions_xy:
+        targets: list[tuple[int, int]] = []  # (polyline_idx, point_idx)
+        for i, arr in enumerate(arrays):
+            if len(arr) == 0:
+                continue
+            d = np.linalg.norm(arr - np.array([jx, jy], dtype=np.float64), axis=1)
+            idx = int(np.argmin(d))
+            if float(d[idx]) <= radius:
+                targets.append((i, idx))
+
+        if len(targets) < 2:
+            continue
+
+        for i, idx in targets:
+            arrays[i][idx] = np.array([jx, jy], dtype=np.float64)
+            protected[i].append((jx, jy))
+
+    snapped = [Polyline2D(points=[(float(x), float(y)) for x, y in arr]) for arr in arrays]
+    return snapped, protected
+
+
+def _polyline_anchor_points(
+    polyline: Polyline2D,
+    protected_points: list[tuple[float, float]] | None,
+) -> list[tuple[float, float]]:
+    anchors: list[tuple[float, float]] = []
+    if polyline.points:
+        anchors.append(polyline.points[0])
+        anchors.append(polyline.points[-1])
+    if protected_points:
+        anchors.extend(protected_points)
+
+    deduped: list[tuple[float, float]] = []
+    seen: set[tuple[float, float]] = set()
+    for x, y in anchors:
+        key = (round(float(x), 4), round(float(y), 4))
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append((float(x), float(y)))
+
+    # Merge near-duplicate anchors to avoid over-constraining one local junction area.
+    merged: list[tuple[float, float]] = []
+    merge_radius = 2.5
+    for ax, ay in deduped:
+        found = False
+        for i, (mx, my) in enumerate(merged):
+            if np.hypot(ax - mx, ay - my) <= merge_radius:
+                merged[i] = ((mx + ax) * 0.5, (my + ay) * 0.5)
+                found = True
+                break
+        if not found:
+            merged.append((ax, ay))
+    return merged
+
+
+def _sample_nurbs_curve(spec: NurbsSpec, n_samples: int) -> np.ndarray:
+    n = max(64, int(n_samples))
+    knots = np.asarray(spec.knots, dtype=np.float64)
+    cps = np.asarray(spec.control_points, dtype=np.float64)
+    u = np.linspace(0.0, 1.0, n, dtype=np.float64)
+
+    bx = BSpline(knots, cps[:, 0], int(spec.degree))
+    by = BSpline(knots, cps[:, 1], int(spec.degree))
+    return np.column_stack([bx(u), by(u)])
+
+
+def _anchor_error_stats(
+    spec: NurbsSpec,
+    anchors: list[tuple[float, float]],
+    sample_count: int,
+) -> dict[str, object]:
+    if not anchors:
+        return {"count": 0, "errors_px": [], "max_px": 0.0, "mean_px": 0.0}
+
+    curve = _sample_nurbs_curve(spec, sample_count)
+    errors: list[float] = []
+    for ax, ay in anchors:
+        d = np.linalg.norm(curve - np.array([ax, ay], dtype=np.float64), axis=1)
+        errors.append(float(d.min(initial=float("inf"))))
+
+    return {
+        "count": len(errors),
+        "errors_px": errors,
+        "max_px": float(max(errors) if errors else 0.0),
+        "mean_px": float(np.mean(errors) if errors else 0.0),
+    }
 
 
 def run_pipeline(
@@ -97,11 +199,34 @@ def run_pipeline(
     if not polylines:
         raise ValueError("No valid path extracted from skeleton")
 
+    protected_points: list[list[tuple[float, float]]] = [[] for _ in polylines]
+    junctions_xy: list[tuple[float, float]] = []
+    if mode == "multi" and cfg.output.multi.preserve_junctions and len(polylines) >= 2:
+        for graph in graphs:
+            junctions_xy.extend(extract_junction_centers(graph, cfg.path_extract))
+        polylines, protected_points = _snap_and_collect_protected_points(
+            polylines=polylines,
+            junctions_xy=junctions_xy,
+            snap_radius=cfg.output.multi.junction_snap_radius_px,
+        )
+
     report["timings"]["path_extract"] = perf_counter() - t3
 
     t4 = perf_counter()
-    simplified_list = [simplify_polyline(polyline, cfg.fit.simplify) for polyline in polylines]
-    nurbs_list: list[NurbsSpec] = [fit_open_nurbs(polyline, cfg.fit) for polyline in simplified_list]
+    simplified_list = [
+        simplify_polyline(polyline, cfg.fit.simplify, protected_points=protected_points[i] if i < len(protected_points) else None)
+        for i, polyline in enumerate(polylines)
+    ]
+    anchor_lists = [
+        _polyline_anchor_points(
+            polyline=simplified_list[i],
+            protected_points=protected_points[i] if i < len(protected_points) else None,
+        )
+        for i in range(len(simplified_list))
+    ]
+    nurbs_list: list[NurbsSpec] = [
+        fit_open_nurbs(polyline, cfg.fit, anchors=anchor_lists[i]) for i, polyline in enumerate(simplified_list)
+    ]
     report["timings"]["fit"] = perf_counter() - t4
 
     t5 = perf_counter()
@@ -119,10 +244,25 @@ def run_pipeline(
         report["control_points"] = [len(ns.control_points) for ns in nurbs_list]
         report["curve_count"] = len(nurbs_list)
 
+    anchor_stats = [
+        _anchor_error_stats(
+            spec=nurbs_list[i],
+            anchors=anchor_lists[i],
+            sample_count=int(cfg.fit.spline.anchor_sample_count),
+        )
+        for i in range(len(nurbs_list))
+    ]
+    report["anchor_error_px"] = {
+        "per_curve": anchor_stats,
+        "max_px": float(max((s["max_px"] for s in anchor_stats), default=0.0)),
+        "mean_px": float(np.mean([s["mean_px"] for s in anchor_stats]) if anchor_stats else 0.0),
+    }
+
     report["graph_nodes"] = sum(len(g.node_points) for g in graphs)
     report["graph_edges"] = sum(len(g.edges) for g in graphs)
     report["component_size_px"] = sum(g.component_size_px for g in graphs)
     report["components"] = len(components)
+    report["junctions_detected"] = len(junctions_xy)
 
     if debug_dir is not None:
         dbg = ensure_debug_dir(debug_dir)

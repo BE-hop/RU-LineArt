@@ -37,6 +37,49 @@ def _rdp(points: np.ndarray, epsilon: float) -> np.ndarray:
     return np.vstack([left[:-1], right])
 
 
+def _protected_indices(
+    points: np.ndarray,
+    protected_points: list[tuple[float, float]] | None,
+    tol: float = 2.0,
+) -> list[int]:
+    if not protected_points or len(points) == 0:
+        return []
+
+    protected: set[int] = set()
+    for px, py in protected_points:
+        target = np.array([px, py], dtype=np.float64)
+        d = np.linalg.norm(points - target, axis=1)
+        idx = int(np.argmin(d))
+        if float(d[idx]) <= tol:
+            protected.add(idx)
+    return sorted(protected)
+
+
+def _rdp_with_protected(points: np.ndarray, epsilon: float, keep_indices: list[int]) -> np.ndarray:
+    if len(points) < 3:
+        return points
+
+    keep = sorted(set([0, len(points) - 1] + keep_indices))
+    if len(keep) <= 2:
+        return _rdp(points, epsilon)
+
+    chunks: list[np.ndarray] = []
+    for i in range(1, len(keep)):
+        a = keep[i - 1]
+        b = keep[i]
+        if b <= a:
+            continue
+        seg = points[a : b + 1]
+        seg_simplified = _rdp(seg, epsilon)
+        if not chunks:
+            chunks.append(seg_simplified)
+        else:
+            chunks.append(seg_simplified[1:])
+    if not chunks:
+        return points[[0, -1]]
+    return np.vstack(chunks)
+
+
 def _moving_average_smooth(points: np.ndarray, window: int, passes: int) -> np.ndarray:
     if len(points) < 3:
         return points
@@ -65,17 +108,29 @@ def _moving_average_smooth(points: np.ndarray, window: int, passes: int) -> np.n
     return out
 
 
-def simplify_polyline(polyline: Polyline2D, cfg: SimplifyConfig) -> Polyline2D:
+def simplify_polyline(
+    polyline: Polyline2D,
+    cfg: SimplifyConfig,
+    protected_points: list[tuple[float, float]] | None = None,
+) -> Polyline2D:
     points = polyline.as_array()
     if len(points) < 3 or cfg.method != "rdp":
         return polyline
 
-    simplified = _rdp(points, float(cfg.epsilon_px))
+    keep_idx = _protected_indices(points, protected_points, tol=max(1.0, float(cfg.epsilon_px) * 2.0))
+    simplified = _rdp_with_protected(points, float(cfg.epsilon_px), keep_idx)
     if cfg.smooth_enable:
         simplified = _moving_average_smooth(
             simplified,
             window=cfg.smooth_window,
             passes=cfg.smooth_passes,
         )
+        # Re-pin protected points after smoothing to preserve topology anchors.
+        if protected_points:
+            targets = np.asarray(protected_points, dtype=np.float64)
+            for idx in _protected_indices(simplified, protected_points, tol=3.0):
+                d = np.linalg.norm(targets - simplified[idx], axis=1)
+                simplified[idx] = targets[int(np.argmin(d))]
+
     out = [(float(x), float(y)) for x, y in simplified]
     return Polyline2D(points=out)

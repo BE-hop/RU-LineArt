@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import heapq
+from dataclasses import dataclass
 import math
 
 import numpy as np
@@ -23,6 +23,21 @@ _NEIGHBORS8 = [
 Pixel = tuple[int, int]
 
 
+@dataclass(slots=True)
+class _SuperEdge:
+    a: int
+    b: int
+    pixels: list[Pixel]  # oriented from a -> b
+    length_px: float
+
+
+@dataclass(slots=True)
+class _SuperGraph:
+    edges: list[_SuperEdge]
+    incident: dict[int, list[int]]
+    centers: dict[int, tuple[float, float]]
+
+
 def _pixel_to_xy(pixel: Pixel) -> tuple[float, float]:
     r, c = pixel
     return float(c), float(-r)
@@ -37,6 +52,58 @@ def _neighbors_on(pixel: Pixel, mask: np.ndarray) -> list[Pixel]:
         if 0 <= nr < h and 0 <= nc < w and mask[nr, nc]:
             out.append((nr, nc))
     return out
+
+
+def _trace_loop(mask: np.ndarray, loop_cut: str) -> list[Pixel]:
+    coords = np.argwhere(mask)
+    if coords.size == 0:
+        return []
+
+    pixels = [(int(r), int(c)) for r, c in coords]
+    if loop_cut == "topmost":
+        start = min(pixels, key=lambda p: (p[0], p[1]))
+    else:
+        start = min(pixels, key=lambda p: (p[1], p[0]))
+
+    path: list[Pixel] = [start]
+    prev: Pixel | None = None
+    curr = start
+    used_edges: set[tuple[Pixel, Pixel]] = set()
+
+    for _ in range(len(pixels) + 8):
+        nbs = _neighbors_on(curr, mask)
+        candidates = [p for p in nbs if prev is None or p != prev]
+        if not candidates:
+            break
+
+        if prev is None:
+            nxt = candidates[0]
+        else:
+            in_vec = (curr[0] - prev[0], curr[1] - prev[1])
+
+            def score(p: Pixel) -> float:
+                out_vec = (p[0] - curr[0], p[1] - curr[1])
+                dot = in_vec[0] * out_vec[0] + in_vec[1] * out_vec[1]
+                norm = math.hypot(*in_vec) * math.hypot(*out_vec)
+                if norm == 0.0:
+                    return -1.0
+                return dot / norm
+
+            candidates.sort(key=score, reverse=True)
+            nxt = candidates[0]
+
+        edge = tuple(sorted((curr, nxt)))
+        if edge in used_edges:
+            break
+        used_edges.add(edge)
+
+        prev, curr = curr, nxt
+        if curr == start:
+            path.append(curr)
+            break
+        path.append(curr)
+
+    return path
 
 
 def choose_main_component(skeleton: SkeletonImage, choose_component: str = "largest") -> SkeletonImage:
@@ -65,192 +132,20 @@ def split_components(skeleton: SkeletonImage) -> list[SkeletonImage]:
     return [comp for _, comp in out]
 
 
-def _build_pixel_adjacency(mask: np.ndarray) -> dict[Pixel, list[Pixel]]:
-    coords = np.argwhere(mask)
-    adjacency: dict[Pixel, list[Pixel]] = {}
-    for r, c in coords:
-        pix = (int(r), int(c))
-        adjacency[pix] = _neighbors_on(pix, mask)
-    return adjacency
-
-
-def _edge_weight(a: Pixel, b: Pixel) -> float:
-    return math.hypot(float(a[0] - b[0]), float(a[1] - b[1]))
-
-
-def _dijkstra_pixels(
-    start: Pixel,
-    adjacency: dict[Pixel, list[Pixel]],
-) -> tuple[dict[Pixel, float], dict[Pixel, Pixel]]:
-    dist: dict[Pixel, float] = {start: 0.0}
-    prev: dict[Pixel, Pixel] = {}
-    heap: list[tuple[float, Pixel]] = [(0.0, start)]
-
-    while heap:
-        d, u = heapq.heappop(heap)
-        if d > dist.get(u, float("inf")):
-            continue
-
-        for v in adjacency.get(u, []):
-            nd = d + _edge_weight(u, v)
-            if nd < dist.get(v, float("inf")):
-                dist[v] = nd
-                prev[v] = u
-                heapq.heappush(heap, (nd, v))
-
-    return dist, prev
-
-
-def _reconstruct_pixel_path(start: Pixel, end: Pixel, prev: dict[Pixel, Pixel]) -> list[Pixel]:
-    out: list[Pixel] = [end]
-    cur = end
-
-    while cur != start:
-        if cur not in prev:
-            return []
-        cur = prev[cur]
-        out.append(cur)
-
-    out.reverse()
-    return out
-
-
-def _path_length(path: list[Pixel]) -> float:
-    if len(path) < 2:
+def _polyline_len_xy(points: list[tuple[float, float]]) -> float:
+    if len(points) < 2:
         return 0.0
-    total = 0.0
-    for i in range(1, len(path)):
-        total += _edge_weight(path[i - 1], path[i])
-    return total
-
-
-def _edge_key(a: Pixel, b: Pixel) -> tuple[Pixel, Pixel]:
-    return tuple(sorted((a, b)))
-
-
-def _unvisited_neighbors(
-    pixel: Pixel,
-    adjacency: dict[Pixel, list[Pixel]],
-    visited_edges: set[tuple[Pixel, Pixel]],
-    prev: Pixel | None = None,
-) -> list[Pixel]:
-    out: list[Pixel] = []
-    for nb in adjacency.get(pixel, []):
-        if prev is not None and nb == prev:
-            continue
-        if _edge_key(pixel, nb) in visited_edges:
-            continue
-        out.append(nb)
-    return out
-
-
-def _trace_from_endpoint_overpass(
-    start: Pixel,
-    adjacency: dict[Pixel, list[Pixel]],
-) -> list[Pixel]:
-    nbs = adjacency.get(start, [])
-    if not nbs:
-        return [start]
-
-    prev = start
-    curr = nbs[0]
-    path: list[Pixel] = [start, curr]
-    visited_edges: set[tuple[Pixel, Pixel]] = {tuple(sorted((start, curr)))}
-    max_steps = max(8, len(adjacency) * 3)
-
-    for _ in range(max_steps):
-        candidates = [p for p in adjacency.get(curr, []) if p != prev]
-        if not candidates:
-            break
-
-        if len(candidates) == 1:
-            nxt = candidates[0]
-        else:
-            incoming = np.array([curr[0] - prev[0], curr[1] - prev[1]], dtype=np.float64)
-
-            def score(p: Pixel) -> float:
-                out = np.array([p[0] - curr[0], p[1] - curr[1]], dtype=np.float64)
-                denom = float(np.linalg.norm(incoming) * np.linalg.norm(out))
-                if denom == 0.0:
-                    return -10.0
-                cos = float(np.dot(incoming, out) / denom)
-                edge = tuple(sorted((curr, p)))
-                if edge in visited_edges:
-                    cos -= 2.0
-                return cos
-
-            candidates.sort(key=score, reverse=True)
-            nxt = candidates[0]
-
-        edge = tuple(sorted((curr, nxt)))
-        if edge in visited_edges:
-            break
-        visited_edges.add(edge)
-
-        prev, curr = curr, nxt
-        path.append(curr)
-
-        if len(adjacency.get(curr, [])) <= 1:
-            break
-
-    return path
-
-
-def _trace_path_from_edge(
-    start: Pixel,
-    first_next: Pixel,
-    adjacency: dict[Pixel, list[Pixel]],
-    visited_edges: set[tuple[Pixel, Pixel]],
-    crossing_policy: str,
-) -> list[Pixel]:
-    prev = start
-    curr = first_next
-    path: list[Pixel] = [start, curr]
-    visited_edges.add(_edge_key(start, curr))
-    max_steps = max(8, len(adjacency) * 3)
-
-    for _ in range(max_steps):
-        candidates = _unvisited_neighbors(curr, adjacency, visited_edges, prev=prev)
-        if not candidates:
-            break
-
-        if len(candidates) == 1:
-            nxt = candidates[0]
-        elif crossing_policy == "overpass":
-            incoming = np.array([curr[0] - prev[0], curr[1] - prev[1]], dtype=np.float64)
-
-            def score(p: Pixel) -> float:
-                out = np.array([p[0] - curr[0], p[1] - curr[1]], dtype=np.float64)
-                denom = float(np.linalg.norm(incoming) * np.linalg.norm(out))
-                if denom == 0.0:
-                    return -10.0
-                return float(np.dot(incoming, out) / denom)
-
-            candidates.sort(key=score, reverse=True)
-            nxt = candidates[0]
-        else:
-            nxt = sorted(candidates)[0]
-
-        ek = _edge_key(curr, nxt)
-        if ek in visited_edges:
-            break
-        visited_edges.add(ek)
-        prev, curr = curr, nxt
-        path.append(curr)
-
-        # If the trace closes a loop, keep one closed cycle and let caller cut to open.
-        if curr == start:
-            break
-
-    return path
+    arr = np.asarray(points, dtype=np.float64)
+    return float(np.linalg.norm(np.diff(arr, axis=0), axis=1).sum())
 
 
 def _cut_loop_open(path: list[Pixel], loop_cut: str) -> list[Pixel]:
-    if len(path) < 3 or path[0] != path[-1]:
+    if len(path) < 3:
         return path
 
-    cycle = path[:-1]
-    if not cycle:
+    closed = path[0] == path[-1]
+    cycle = path[:-1] if closed else path
+    if len(cycle) < 2:
         return path
 
     if loop_cut == "topmost":
@@ -258,7 +153,6 @@ def _cut_loop_open(path: list[Pixel], loop_cut: str) -> list[Pixel]:
     elif loop_cut == "leftmost":
         idx = min(range(len(cycle)), key=lambda i: (cycle[i][1], cycle[i][0]))
     else:
-        # min_curvature: prefer a straight-ish point as cut location.
         if len(cycle) < 3:
             idx = 0
         else:
@@ -277,61 +171,249 @@ def _cut_loop_open(path: list[Pixel], loop_cut: str) -> list[Pixel]:
                     scores.append(float(np.dot(v1, v2) / denom))
             idx = int(np.argmax(scores))
 
-    rotated = cycle[idx:] + cycle[:idx]
-    return rotated
+    return cycle[idx:] + cycle[:idx]
 
 
-def _polyline_len_xy(points: list[tuple[float, float]]) -> float:
-    if len(points) < 2:
-        return 0.0
-    arr = np.asarray(points, dtype=np.float64)
-    return float(np.linalg.norm(np.diff(arr, axis=0), axis=1).sum())
+def _build_super_graph(graph: StrokeGraph, cfg: PathExtractConfig) -> _SuperGraph:
+    if not graph.node_points:
+        return _SuperGraph(edges=[], incident={}, centers={})
+
+    node_ids = sorted(graph.node_points.keys())
+    deg = {nid: len(graph.adjacency.get(nid, set())) for nid in node_ids}
+    junctions = [nid for nid in node_ids if deg[nid] >= 3]
+    radius = max(1.0, float(getattr(cfg, "cluster_radius_px", 4.0)))
+
+    parent = {nid: nid for nid in node_ids}
+
+    def find(x: int) -> int:
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def union(a: int, b: int) -> None:
+        ra = find(a)
+        rb = find(b)
+        if ra != rb:
+            parent[rb] = ra
+
+    # Spatial clustering of junction pixels.
+    for i in range(len(junctions)):
+        a = junctions[i]
+        ar, ac = graph.node_points[a]
+        for j in range(i + 1, len(junctions)):
+            b = junctions[j]
+            br, bc = graph.node_points[b]
+            if math.hypot(float(ar - br), float(ac - bc)) <= radius:
+                union(a, b)
+
+    # Also merge tiny edges inside junction neighborhoods.
+    short_thresh = max(2.0, 0.75 * radius)
+    for edge in graph.edges:
+        if edge.length_px <= short_thresh and deg.get(edge.start, 0) >= 3 and deg.get(edge.end, 0) >= 3:
+            union(edge.start, edge.end)
+
+    # Merge nearby junction clusters connected by a short bridge. This prevents
+    # one visual crossing from being split into multiple super-nodes.
+    bridge_thresh = max(short_thresh, float(getattr(cfg, "junction_bridge_max_px", 12.0)))
+    for edge in graph.edges:
+        if edge.length_px <= bridge_thresh and deg.get(edge.start, 0) >= 3 and deg.get(edge.end, 0) >= 3:
+            union(edge.start, edge.end)
+
+    root_key: dict[int, tuple[str, int]] = {}
+    for nid in node_ids:
+        if deg[nid] >= 3:
+            root_key[nid] = ("j", find(nid))
+        else:
+            root_key[nid] = ("n", nid)
+
+    key_to_super: dict[tuple[str, int], int] = {}
+    super_members: dict[int, list[int]] = {}
+    for nid in node_ids:
+        key = root_key[nid]
+        sid = key_to_super.setdefault(key, len(key_to_super))
+        super_members.setdefault(sid, []).append(nid)
+
+    centers: dict[int, tuple[float, float]] = {}
+    for sid, members in super_members.items():
+        pts = np.asarray([graph.node_points[m] for m in members], dtype=np.float64)
+        centers[sid] = (float(np.mean(pts[:, 0])), float(np.mean(pts[:, 1])))
+
+    # Keep parallel edges between the same super-node pair: they may represent
+    # distinct strokes crossing the same junction neighborhood.
+    edges: list[_SuperEdge] = []
+    for edge in graph.edges:
+        sa = key_to_super[root_key[edge.start]]
+        sb = key_to_super[root_key[edge.end]]
+        if sa == sb:
+            continue
+
+        a, b = (sa, sb) if sa < sb else (sb, sa)
+        if sa == a and sb == b:
+            pixels = edge.pixels
+        else:
+            pixels = list(reversed(edge.pixels))
+
+        edges.append(_SuperEdge(a=a, b=b, pixels=pixels, length_px=float(edge.length_px)))
+
+    incident: dict[int, list[int]] = {sid: [] for sid in centers}
+    for eid, edge in enumerate(edges):
+        incident.setdefault(edge.a, []).append(eid)
+        incident.setdefault(edge.b, []).append(eid)
+
+    return _SuperGraph(edges=edges, incident=incident, centers=centers)
 
 
-def _extract_endpoint_pair_paths(adjacency: dict[Pixel, list[Pixel]]) -> list[list[Pixel]]:
-    endpoints = sorted([pix for pix, nbs in adjacency.items() if len(nbs) == 1])
-    if len(endpoints) < 2:
-        return []
+def _edge_pixels_from_node(edge: _SuperEdge, node: int) -> tuple[list[Pixel], int]:
+    if node == edge.a:
+        return edge.pixels, edge.b
+    return list(reversed(edge.pixels)), edge.a
 
-    dist_cache: dict[Pixel, dict[Pixel, float]] = {}
-    prev_cache: dict[Pixel, dict[Pixel, Pixel]] = {}
-    for ep in endpoints:
-        dist, prev = _dijkstra_pixels(ep, adjacency)
-        dist_cache[ep] = dist
-        prev_cache[ep] = prev
 
-    remaining = set(endpoints)
-    pairs: list[tuple[Pixel, Pixel, float]] = []
+def _edge_outward_direction(edge: _SuperEdge, node: int, centers: dict[int, tuple[float, float]], tangent_k: int) -> np.ndarray:
+    pixels, other = _edge_pixels_from_node(edge, node)
+    if len(pixels) >= 2:
+        k = min(len(pixels) - 1, max(1, int(tangent_k)))
+        p0 = np.array(pixels[0], dtype=np.float64)
+        p1 = np.array(pixels[k], dtype=np.float64)
+        vec = p1 - p0
+    else:
+        c0 = np.array(centers[node], dtype=np.float64)
+        c1 = np.array(centers[other], dtype=np.float64)
+        vec = c1 - c0
 
-    while len(remaining) >= 2:
-        ordered = sorted(remaining)
-        best_pair: tuple[Pixel, Pixel, float] | None = None
-        for i in range(len(ordered)):
-            for j in range(i + 1, len(ordered)):
-                a = ordered[i]
-                b = ordered[j]
-                d = dist_cache.get(a, {}).get(b)
-                if d is None:
-                    continue
-                if best_pair is None or d > best_pair[2]:
-                    best_pair = (a, b, float(d))
+    norm = float(np.linalg.norm(vec))
+    if norm == 0.0:
+        return np.array([0.0, 0.0], dtype=np.float64)
+    return vec / norm
 
-        if best_pair is None:
+
+def _build_continuation_map(super_graph: _SuperGraph, cfg: PathExtractConfig) -> dict[tuple[int, int], int]:
+    continuation: dict[tuple[int, int], int] = {}
+    tangent_k = int(getattr(cfg, "tangent_k", 10))
+
+    def edge_pair_score(node: int, e1: int, e2: int) -> float:
+        v1 = _edge_outward_direction(super_graph.edges[e1], node, super_graph.centers, tangent_k)
+        v2 = _edge_outward_direction(super_graph.edges[e2], node, super_graph.centers, tangent_k)
+        # Lower is better. Opposite directions (straight-through) -> dot ~= -1.
+        return float(np.dot(v1, v2))
+
+    def solve_pairs_exact(node: int, eids: list[int]) -> list[tuple[int, int]]:
+        # Brute-force with memoization; degrees here are usually small.
+        sorted_eids = tuple(sorted(eids))
+        cache: dict[tuple[int, ...], tuple[float, tuple[tuple[int, int], ...]]] = {}
+
+        def solve_even(state: tuple[int, ...]) -> tuple[float, tuple[tuple[int, int], ...]]:
+            if not state:
+                return 0.0, tuple()
+            if state in cache:
+                return cache[state]
+
+            first = state[0]
+            best_cost = float("inf")
+            best_pairs: tuple[tuple[int, int], ...] = tuple()
+
+            for i in range(1, len(state)):
+                second = state[i]
+                rest = state[1:i] + state[i + 1 :]
+                rest_cost, rest_pairs = solve_even(rest)
+                pair_cost = edge_pair_score(node, first, second)
+                total = pair_cost + rest_cost
+                if total < best_cost:
+                    pair = (first, second)
+                    best_cost = total
+                    best_pairs = (pair, *rest_pairs)
+
+            cache[state] = (best_cost, best_pairs)
+            return cache[state]
+
+        if len(sorted_eids) % 2 == 0:
+            return list(solve_even(sorted_eids)[1])
+
+        # Odd degree: leave one branch unmatched, pair the rest optimally.
+        best_cost = float("inf")
+        best_pairs: list[tuple[int, int]] = []
+        best_left_len = float("inf")
+        for leftover in sorted_eids:
+            rest = tuple(e for e in sorted_eids if e != leftover)
+            cost, pairs = solve_even(rest)
+            left_len = super_graph.edges[leftover].length_px
+            if cost < best_cost or (math.isclose(cost, best_cost) and left_len < best_left_len):
+                best_cost = cost
+                best_pairs = list(pairs)
+                best_left_len = left_len
+        return best_pairs
+
+    def solve_pairs_greedy(node: int, eids: list[int]) -> list[tuple[int, int]]:
+        remaining = list(eids)
+        pairs: list[tuple[int, int]] = []
+        while len(remaining) >= 2:
+            best_pair: tuple[int, int] | None = None
+            best_score = float("inf")
+            for i in range(len(remaining)):
+                for j in range(i + 1, len(remaining)):
+                    e1 = remaining[i]
+                    e2 = remaining[j]
+                    score = edge_pair_score(node, e1, e2)
+                    if score < best_score:
+                        best_score = score
+                        best_pair = (e1, e2)
+            if best_pair is None:
+                break
+            e1, e2 = best_pair
+            pairs.append((e1, e2))
+            remaining.remove(e1)
+            remaining.remove(e2)
+        return pairs
+
+    for node, eids in super_graph.incident.items():
+        if len(eids) < 2:
+            continue
+        if len(eids) <= 10:
+            pairs = solve_pairs_exact(node, eids)
+        else:
+            pairs = solve_pairs_greedy(node, eids)
+
+        for e1, e2 in pairs:
+            continuation[(node, e1)] = e2
+            continuation[(node, e2)] = e1
+
+    return continuation
+
+
+def _trace_stroke_from(
+    start_node: int,
+    start_edge: int,
+    super_graph: _SuperGraph,
+    continuation: dict[tuple[int, int], int],
+    visited_edges: set[int],
+) -> list[Pixel]:
+    path: list[Pixel] = []
+    curr_node = start_node
+    curr_edge = start_edge
+    step_cap = max(16, len(super_graph.edges) * 3)
+
+    for _ in range(step_cap):
+        if curr_edge in visited_edges:
+            break
+        visited_edges.add(curr_edge)
+
+        edge = super_graph.edges[curr_edge]
+        seg, next_node = _edge_pixels_from_node(edge, curr_node)
+
+        if not path:
+            path.extend(seg)
+        else:
+            path.extend(seg[1:])
+
+        next_edge = continuation.get((next_node, curr_edge))
+        if next_edge is None or next_edge in visited_edges:
             break
 
-        a, b, d = best_pair
-        pairs.append((a, b, d))
-        remaining.remove(a)
-        remaining.remove(b)
+        curr_node = next_node
+        curr_edge = next_edge
 
-    paths: list[list[Pixel]] = []
-    for a, b, _ in pairs:
-        prev = prev_cache[a]
-        path = _reconstruct_pixel_path(a, b, prev)
-        if len(path) >= 2:
-            paths.append(path)
-
-    return paths
+    return path
 
 
 def extract_open_paths(
@@ -342,25 +424,54 @@ def extract_open_paths(
     max_curves: int | None = None,
     include_loops: bool = True,
 ) -> list[Polyline2D]:
-    del graph
-
     mask = skeleton.astype(bool)
     if int(mask.sum()) == 0:
         return []
 
-    adjacency = _build_pixel_adjacency(mask)
-    pixel_paths = _extract_endpoint_pair_paths(adjacency)
+    super_graph = _build_super_graph(graph, cfg)
 
-    if not pixel_paths and include_loops:
+    # Fallback for pure loops / degenerate graphs.
+    if not super_graph.edges:
+        if not include_loops:
+            return []
         loop_path = _trace_loop(mask, cfg.loop_cut)
-        if len(loop_path) >= 2:
-            pixel_paths = [loop_path]
+        if len(loop_path) < 2:
+            return []
+        open_loop = _cut_loop_open(loop_path, cfg.loop_cut)
+        points = [_pixel_to_xy(p) for p in open_loop]
+        return [Polyline2D(points=points)] if _polyline_len_xy(points) >= float(min_length_px) else []
+
+    continuation = _build_continuation_map(super_graph, cfg)
+    visited_edges: set[int] = set()
+    pixel_paths: list[list[Pixel]] = []
+
+    endpoints = sorted([node for node, eids in super_graph.incident.items() if len(eids) == 1])
+
+    # Trace from endpoints first (open strokes).
+    for node in endpoints:
+        for eid in super_graph.incident.get(node, []):
+            if eid in visited_edges:
+                continue
+            path = _trace_stroke_from(node, eid, super_graph, continuation, visited_edges)
+            if len(path) >= 2:
+                pixel_paths.append(path)
+
+    # Then consume leftover edges (loops or unmatched branches).
+    for eid, edge in enumerate(super_graph.edges):
+        if eid in visited_edges:
+            continue
+        path = _trace_stroke_from(edge.a, eid, super_graph, continuation, visited_edges)
+        if len(path) >= 2:
+            pixel_paths.append(path)
 
     out: list[Polyline2D] = []
     for path in pixel_paths:
         if len(path) < 2:
             continue
+
         if path[0] == path[-1]:
+            if not include_loops:
+                continue
             path = _cut_loop_open(path, cfg.loop_cut)
             if len(path) < 2:
                 continue
@@ -377,85 +488,6 @@ def extract_open_paths(
     return out
 
 
-def _extract_overpass_main_path(adjacency: dict[Pixel, list[Pixel]], endpoints: list[Pixel]) -> list[Pixel]:
-    best_path: list[Pixel] = []
-    best_len = -1.0
-
-    # Track best candidate for each unordered endpoint pair to avoid duplicates.
-    per_pair_best: dict[tuple[Pixel, Pixel], tuple[float, list[Pixel]]] = {}
-
-    for ep in endpoints:
-        candidate = _trace_from_endpoint_overpass(ep, adjacency)
-        if len(candidate) < 2:
-            continue
-
-        a, b = candidate[0], candidate[-1]
-        pair = tuple(sorted((a, b)))
-        plen = _path_length(candidate)
-
-        prev_best = per_pair_best.get(pair)
-        if prev_best is None or plen > prev_best[0]:
-            per_pair_best[pair] = (plen, candidate)
-
-    for plen, path in per_pair_best.values():
-        if plen > best_len:
-            best_len = plen
-            best_path = path
-
-    return best_path
-
-
-def _trace_loop(mask: np.ndarray, loop_cut: str) -> list[Pixel]:
-    coords = np.argwhere(mask)
-    if coords.size == 0:
-        return []
-
-    pixels = [(int(r), int(c)) for r, c in coords]
-    if loop_cut == "topmost":
-        start = min(pixels, key=lambda p: (p[0], p[1]))
-    else:
-        start = min(pixels, key=lambda p: (p[1], p[0]))
-
-    path: list[Pixel] = [start]
-    prev: Pixel | None = None
-    curr = start
-    used_edges: set[tuple[Pixel, Pixel]] = set()
-
-    for _ in range(len(pixels) + 5):
-        nbs = _neighbors_on(curr, mask)
-        candidates = [p for p in nbs if prev is None or p != prev]
-        if not candidates:
-            break
-
-        if prev is None:
-            nxt = candidates[0]
-        else:
-            in_vec = (curr[0] - prev[0], curr[1] - prev[1])
-
-            def score(p: Pixel) -> float:
-                out_vec = (p[0] - curr[0], p[1] - curr[1])
-                dot = in_vec[0] * out_vec[0] + in_vec[1] * out_vec[1]
-                norm = math.hypot(*in_vec) * math.hypot(*out_vec)
-                if norm == 0:
-                    return -1.0
-                return dot / norm
-
-            candidates.sort(key=score, reverse=True)
-            nxt = candidates[0]
-
-        edge = tuple(sorted((curr, nxt)))
-        if edge in used_edges:
-            break
-        used_edges.add(edge)
-
-        prev, curr = curr, nxt
-        if curr == start:
-            break
-        path.append(curr)
-
-    return path
-
-
 def extract_main_open_path(
     skeleton: SkeletonImage,
     graph: StrokeGraph,
@@ -466,9 +498,26 @@ def extract_main_open_path(
         graph=graph,
         cfg=cfg,
         min_length_px=0.0,
-        max_curves=1,
+        max_curves=None,
         include_loops=True,
     )
     if not paths:
         raise ValueError("Empty skeleton component")
+
+    paths.sort(key=lambda pl: _polyline_len_xy(pl.points), reverse=True)
     return paths[0]
+
+
+def extract_junction_centers(
+    graph: StrokeGraph,
+    cfg: PathExtractConfig,
+) -> list[tuple[float, float]]:
+    """Return stable XY junction anchors from the same super-graph used for path extraction."""
+    super_graph = _build_super_graph(graph, cfg)
+    out: list[tuple[float, float]] = []
+    for node, eids in super_graph.incident.items():
+        if len(eids) < 3:
+            continue
+        r, c = super_graph.centers[node]
+        out.append((float(c), float(-r)))
+    return out
