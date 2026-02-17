@@ -53,6 +53,17 @@ class SimplifyConfig(BaseModel):
     smooth_passes: int = 1
 
 
+class StabilizeConfig(BaseModel):
+    enable: bool = False
+    method: str = "savgol"
+    window: int = 11
+    polyorder: int = 2
+    passes: int = 2
+    blend: float = 0.7
+    resample_step_px: float = 1.0
+    anchor_snap_radius_px: float = 4.0
+
+
 class SplineConfig(BaseModel):
     smoothing: float = 6.0
     max_iter: int = 6
@@ -69,6 +80,7 @@ class SplineConfig(BaseModel):
 class FitConfig(BaseModel):
     degree: int = 3
     max_control_points: int = 50
+    stabilize: StabilizeConfig = Field(default_factory=StabilizeConfig)
     simplify: SimplifyConfig = Field(default_factory=SimplifyConfig)
     spline: SplineConfig = Field(default_factory=SplineConfig)
 

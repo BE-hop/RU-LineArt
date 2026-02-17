@@ -19,6 +19,7 @@ from sketch2rhino.debug.overlays import save_path_overlay
 from sketch2rhino.export.rhino3dm_writer import write_3dm, write_3dm_many
 from sketch2rhino.fit.nurbs_fit import fit_open_nurbs
 from sketch2rhino.fit.polyline_simplify import simplify_polyline
+from sketch2rhino.fit.stroke_stabilize import stabilize_polyline
 from sketch2rhino.topo.graph_build import build_stroke_graph
 from sketch2rhino.topo.path_extract import (
     choose_main_component,
@@ -213,9 +214,21 @@ def run_pipeline(
     report["timings"]["path_extract"] = perf_counter() - t3
 
     t4 = perf_counter()
-    simplified_list = [
-        simplify_polyline(polyline, cfg.fit.simplify, protected_points=protected_points[i] if i < len(protected_points) else None)
+    stabilized_list = [
+        stabilize_polyline(
+            polyline,
+            cfg.fit.stabilize,
+            protected_points=protected_points[i] if i < len(protected_points) else None,
+        )
         for i, polyline in enumerate(polylines)
+    ]
+    simplified_list = [
+        simplify_polyline(
+            polyline,
+            cfg.fit.simplify,
+            protected_points=protected_points[i] if i < len(protected_points) else None,
+        )
+        for i, polyline in enumerate(stabilized_list)
     ]
     anchor_lists = [
         _polyline_anchor_points(

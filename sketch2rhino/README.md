@@ -85,6 +85,11 @@ Crossing-focused extraction controls:
 
 Recommended smoothing-first defaults (already reflected in `configs/default.yaml`):
 
+- `fit.stabilize.enable: false` (set `true` for hand-drawn anti-jitter)
+- `fit.stabilize.method: "savgol"`
+- `fit.stabilize.window: 11`
+- `fit.stabilize.passes: 2`
+- `fit.stabilize.blend: 0.7`
 - `fit.simplify.epsilon_px: 1.2`
 - `fit.simplify.smooth_enable: false`
 - `fit.simplify.smooth_window: 7`
@@ -99,6 +104,17 @@ Recommended smoothing-first defaults (already reflected in `configs/default.yaml
 If curve shape becomes too loose, reduce `fit.spline.smoothing` first (e.g. `6 -> 3`).
 If curves become too jagged, increase `fit.spline.smoothing` slightly (e.g. `6 -> 10`).
 If crossings drift apart, increase `fit.spline.anchor_weight` (e.g. `20 -> 28`).
+If hand-drawn jitter remains, enable `fit.stabilize.enable` and raise `fit.stabilize.window` (e.g. `11 -> 15`).
+
+Hand-drawn preset (stabilization enabled):
+
+```bash
+.venv/bin/sketch2rhino run \
+  --image data/samples/sample.png \
+  --out   data/outputs/sample_smooth.3dm \
+  --config configs/handdrawn_smooth.yaml \
+  --debug data/outputs/debug_sample_smooth
+```
 
 ## Safe Environment Workflow (Important)
 
@@ -136,6 +152,7 @@ If `pytest` resolves to something like `/opt/anaconda3/bin/pytest`, you are not 
 - crossings are treated as overpasses using direction-based continuation pairing
 
 4. Fit:
+- optional stroke stabilization (Procreate-like anti-jitter)
 - simplify polyline
 - fit an open B-spline / NURBS with control points ≤ 50 (best-effort)
 

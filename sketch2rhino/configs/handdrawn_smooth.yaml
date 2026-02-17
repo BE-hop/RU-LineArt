@@ -29,13 +29,13 @@ fit:
   degree: 3
   max_control_points: 50
   stabilize:
-    enable: false
+    enable: true
     method: "savgol"
-    window: 11
+    window: 13
     polyorder: 2
     passes: 2
-    blend: 0.7
-    resample_step_px: 1.0
+    blend: 0.75
+    resample_step_px: 0.8
     anchor_snap_radius_px: 4.0
   simplify:
     method: "rdp"       # Ramer-Douglas-Peucker
@@ -44,7 +44,7 @@ fit:
     smooth_window: 7
     smooth_passes: 1
   spline:
-    smoothing: 6.0      # balanced: reduce jitter while preserving shape
+    smoothing: 6.0
     max_iter: 6
     fallback_if_fail: true
     anchor_correction_enable: true

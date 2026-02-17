@@ -9,3 +9,14 @@ __pycache__/
 
 data/outputs/*
 !data/outputs/.gitkeep
+
+# desktop app generated artifacts
+desktop_app/__pycache__/
+desktop_app/build/
+desktop_app/build_windows/
+desktop_app/dist/
+desktop_app/dist_windows/
+desktop_app/*.spec
+desktop_app/.DS_Store
+desktop_app/release/*
+!desktop_app/release/.gitkeep
