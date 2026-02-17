@@ -75,7 +75,7 @@ Output:
 
 GitHub Actions:
 
-- Workflow file: `/Users/mac/Documents/RU-LineArt/sketch2rhino/.github/workflows/build-windows-desktop.yml`
+- Workflow file: `/Users/mac/Documents/RU-LineArt/.github/workflows/build-windows-desktop.yml`
 - Trigger manually from Actions page: `Build RU-LineArt Windows App`
 - Download artifact: `RU-LineArt-windows`
 - Artifact content: `RU-LineArt-windows.zip` (contains `RU-LineArt.exe` and runtime files)
