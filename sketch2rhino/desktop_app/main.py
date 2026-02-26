@@ -3,17 +3,20 @@ from __future__ import annotations
 import json
 import os
 import re
+import ssl
 import sys
 import traceback
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
+from time import sleep
 
 from PySide6.QtCore import QThread, Qt, QUrl, Signal
 from PySide6.QtGui import QDesktopServices, QIcon
 from PySide6.QtWidgets import (
     QApplication,
+    QComboBox,
     QFileDialog,
     QGridLayout,
     QGroupBox,
@@ -43,11 +46,23 @@ from sketch2rhino import __version__  # noqa: E402
 from sketch2rhino.config import load_config  # noqa: E402
 from sketch2rhino.pipeline import run_pipeline  # noqa: E402
 
+try:
+    import certifi as _certifi  # type: ignore[import-not-found]
+except Exception:
+    _certifi = None
+
+try:
+    from pip._vendor import certifi as _pip_certifi  # type: ignore[import-not-found]
+except Exception:
+    _pip_certifi = None
+
 
 IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".webp"}
 DEFAULT_UPDATE_FEED_URL = "https://www.behop.cn/behop-ai-product/products/ru-lineart/version.json"
 DEFAULT_UPDATE_PAGE_URL = "https://www.behop.cn/behop-ai-product/products/ru-lineart/"
-UPDATE_CHECK_TIMEOUT_SEC = 3.0
+UPDATE_CHECK_TIMEOUT_SEC = 8.0
+UPDATE_CHECK_RETRY_COUNT = 2
+UPDATE_CHECK_RETRY_DELAY_SEC = 0.6
 
 
 def is_image_file(path: Path) -> bool:
@@ -56,6 +71,15 @@ def is_image_file(path: Path) -> bool:
 
 def bi(zh: str, en: str) -> str:
     return f"{zh} / {en}"
+
+
+GEOMETRY_MODE_CHOICES: list[tuple[str, str]] = [
+    ("polyline_only", bi("直线", "Straight")),
+    ("nurbs_only", bi("曲线", "Curves")),
+    ("mixed", bi("混合", "Mixed")),
+]
+GEOMETRY_MODE_LABELS: dict[str, str] = dict(GEOMETRY_MODE_CHOICES)
+VALID_GEOMETRY_MODES = set(GEOMETRY_MODE_LABELS.keys())
 
 
 @dataclass(frozen=True)
@@ -69,6 +93,26 @@ class UpdateInfo:
 def update_feed_url() -> str:
     custom = os.environ.get("RU_LINEART_UPDATE_JSON_URL", "").strip()
     return custom or DEFAULT_UPDATE_FEED_URL
+
+
+def bundled_ca_bundle_path() -> Path | None:
+    if hasattr(sys, "_MEIPASS"):
+        bundled = Path(getattr(sys, "_MEIPASS")) / "assets" / "cacert.pem"
+        if bundled.exists():
+            return bundled
+
+    local = Path(__file__).resolve().parent / "assets" / "cacert.pem"
+    if local.exists():
+        return local
+    return None
+
+
+def update_feed_candidates(feed_url: str) -> list[str]:
+    candidates = [feed_url]
+    marker = "://www."
+    if marker in feed_url:
+        candidates.append(feed_url.replace(marker, "://", 1))
+    return candidates
 
 
 def _version_parts(raw: str) -> tuple[int, ...]:
@@ -113,13 +157,60 @@ def _parse_update_info(data: dict[str, object]) -> UpdateInfo | None:
     return UpdateInfo(latest=latest, page=page, force=force, notes=notes)
 
 
+def _ca_bundle_paths() -> list[str]:
+    paths: list[str] = []
+    bundled = bundled_ca_bundle_path()
+    if bundled is not None:
+        paths.append(str(bundled))
+
+    for provider in (_certifi, _pip_certifi):
+        if provider is None:
+            continue
+        try:
+            path = str(provider.where()).strip()
+        except Exception:
+            continue
+        if path and path not in paths:
+            paths.append(path)
+    return paths
+
+
+def _ssl_context_candidates() -> list[ssl.SSLContext]:
+    contexts: list[ssl.SSLContext] = [ssl.create_default_context()]
+    for ca_path in _ca_bundle_paths():
+        try:
+            contexts.append(ssl.create_default_context(cafile=ca_path))
+        except Exception:
+            continue
+    return contexts
+
+
 def fetch_update_info(feed_url: str) -> UpdateInfo | None:
     request = urllib.request.Request(
         feed_url,
         headers={"User-Agent": f"RU-LineArt/{__version__}"},
     )
-    with urllib.request.urlopen(request, timeout=UPDATE_CHECK_TIMEOUT_SEC) as resp:
-        payload = resp.read().decode("utf-8")
+    last_exc: Exception | None = None
+    payload = ""
+    for ssl_ctx in _ssl_context_candidates():
+        try:
+            with urllib.request.urlopen(request, timeout=UPDATE_CHECK_TIMEOUT_SEC, context=ssl_ctx) as resp:
+                payload = resp.read().decode("utf-8")
+            break
+        except urllib.error.URLError as exc:
+            last_exc = exc
+            reason = getattr(exc, "reason", None)
+            if isinstance(reason, ssl.SSLError):
+                continue
+            raise
+        except ssl.SSLError as exc:
+            last_exc = exc
+            continue
+    else:
+        if last_exc is not None:
+            raise last_exc
+        raise urllib.error.URLError("Update feed request failed")
+
     parsed = json.loads(payload)
     if not isinstance(parsed, dict):
         return None
@@ -154,15 +245,28 @@ class ConvertWorker(QThread):
     done = Signal(str)
     failed = Signal(str)
 
-    def __init__(self, image_path: Path, output_path: Path, config_path: Path | None) -> None:
+    def __init__(
+        self,
+        image_path: Path,
+        output_path: Path,
+        config_path: Path | None,
+        geometry_mode: str,
+    ) -> None:
         super().__init__()
         self.image_path = image_path
         self.output_path = output_path
         self.config_path = config_path
+        self.geometry_mode = geometry_mode
 
     def run(self) -> None:  # noqa: D401
         try:
             cfg = load_config(self.config_path)
+            if self.geometry_mode not in VALID_GEOMETRY_MODES:
+                raise ValueError(
+                    f"Unsupported geometry mode: {self.geometry_mode}. "
+                    "Expected one of: mixed, polyline_only, nurbs_only."
+                )
+            cfg.fit.geometry_mode = self.geometry_mode
             result = run_pipeline(
                 image_path=self.image_path,
                 output_path=self.output_path,
@@ -176,6 +280,7 @@ class ConvertWorker(QThread):
 
 class UpdateCheckWorker(QThread):
     found = Signal(object)
+    status = Signal(str)
 
     def __init__(self, current_version: str, feed_url: str) -> None:
         super().__init__()
@@ -183,15 +288,31 @@ class UpdateCheckWorker(QThread):
         self.feed_url = feed_url
 
     def run(self) -> None:  # noqa: D401
-        try:
-            info = fetch_update_info(self.feed_url)
-            if info is None:
-                return
-            if is_newer_version(info.latest, self.current_version):
-                self.found.emit(info)
-        except (urllib.error.URLError, TimeoutError, OSError, ValueError):
-            # Network or JSON errors should not block app startup.
-            return
+        last_error = ""
+        for candidate in update_feed_candidates(self.feed_url):
+            for attempt in range(UPDATE_CHECK_RETRY_COUNT):
+                try:
+                    info = fetch_update_info(candidate)
+                    if info is None:
+                        self.status.emit("invalid_feed")
+                        return
+                    if is_newer_version(info.latest, self.current_version):
+                        self.status.emit(f"update_available:{info.latest}")
+                        self.found.emit(info)
+                    else:
+                        self.status.emit(f"no_update:{info.latest}")
+                    return
+                except (urllib.error.URLError, TimeoutError, OSError, ValueError) as exc:
+                    # Network/JSON errors should not block app startup.
+                    last_error = f"{exc.__class__.__name__}: {exc}"
+                    if attempt + 1 < UPDATE_CHECK_RETRY_COUNT:
+                        sleep(UPDATE_CHECK_RETRY_DELAY_SEC)
+                    continue
+
+        if last_error:
+            self.status.emit(f"check_failed:{last_error}")
+        else:
+            self.status.emit("check_failed")
 
 
 class MainWindow(QMainWindow):
@@ -256,6 +377,13 @@ class MainWindow(QMainWindow):
         self.config_btn = QPushButton(bi("配置文件", "Config"))
         self.config_btn.clicked.connect(self._pick_config)
 
+        self.mode_combo = QComboBox()
+        for mode, label in GEOMETRY_MODE_CHOICES:
+            self.mode_combo.addItem(label, mode)
+        nurbs_idx = self.mode_combo.findData("nurbs_only", Qt.UserRole)
+        if nurbs_idx >= 0:
+            self.mode_combo.setCurrentIndex(nurbs_idx)
+
         grid.addWidget(QLabel(bi("图片", "Image")), 0, 0)
         grid.addWidget(self.image_edit, 0, 1)
         grid.addWidget(self.image_btn, 0, 2)
@@ -267,6 +395,9 @@ class MainWindow(QMainWindow):
         grid.addWidget(QLabel(bi("配置", "Config")), 2, 0)
         grid.addWidget(self.config_edit, 2, 1)
         grid.addWidget(self.config_btn, 2, 2)
+
+        grid.addWidget(QLabel(bi("模式", "Mode")), 3, 0)
+        grid.addWidget(self.mode_combo, 3, 1, 1, 2)
 
         layout.addWidget(file_group)
 
@@ -291,6 +422,7 @@ class MainWindow(QMainWindow):
         feed_url = update_feed_url()
         self.update_worker = UpdateCheckWorker(current_version=self.current_version, feed_url=feed_url)
         self.update_worker.found.connect(self._on_update_found)
+        self.update_worker.status.connect(self._on_update_status)
         self.update_worker.start()
         self._log(
             f"{bi('当前版本', 'Current version')}: {self.current_version} | "
@@ -340,6 +472,7 @@ class MainWindow(QMainWindow):
             output = Path(output_text)
             cfg_text = self.config_edit.text().strip()
             config = Path(cfg_text) if cfg_text else None
+            geometry_mode = str(self.mode_combo.currentData(Qt.UserRole) or "mixed").strip().lower()
         except Exception:
             QMessageBox.critical(self, bi("输入无效", "Invalid input"), bi("路径格式无效。", "Path is invalid."))
             return
@@ -362,11 +495,22 @@ class MainWindow(QMainWindow):
         if config is not None and not config.exists():
             QMessageBox.warning(self, bi("配置文件不存在", "Config missing"), bi("配置文件不存在。", "Config file does not exist."))
             return
+        if geometry_mode not in VALID_GEOMETRY_MODES:
+            QMessageBox.warning(self, bi("模式无效", "Invalid mode"), bi("请选择有效模式。", "Please choose a valid mode."))
+            return
 
         self.generate_btn.setEnabled(False)
-        self._log(bi("正在转换...", "Converting..."))
+        self._log(
+            f"{bi('正在转换...', 'Converting...')} "
+            f"{bi('模式', 'Mode')}: {GEOMETRY_MODE_LABELS.get(geometry_mode, geometry_mode)}"
+        )
 
-        self.worker = ConvertWorker(image_path=image, output_path=output, config_path=config)
+        self.worker = ConvertWorker(
+            image_path=image,
+            output_path=output,
+            config_path=config,
+            geometry_mode=geometry_mode,
+        )
         self.worker.done.connect(self._on_done)
         self.worker.failed.connect(self._on_failed)
         self.worker.finished.connect(lambda: self.generate_btn.setEnabled(True))
@@ -396,6 +540,33 @@ class MainWindow(QMainWindow):
             self._show_force_update_dialog(payload)
         else:
             self._show_optional_update_dialog(payload)
+
+    def _on_update_status(self, status: str) -> None:
+        if status == "invalid_feed":
+            self._log(bi("更新检查失败：版本信息格式无效。", "Update check failed: invalid feed format."))
+            return
+        if status == "check_failed":
+            self._log(
+                bi(
+                    "更新检查失败：网络不可用、DNS 解析失败或请求超时。",
+                    "Update check failed: network unavailable, DNS resolution failed, or timeout.",
+                )
+            )
+            return
+        if status.startswith("check_failed:"):
+            reason = status.split(":", 1)[1].strip()
+            self._log(
+                f"{bi('更新检查失败', 'Update check failed')}: "
+                f"{reason or bi('网络不可用、DNS 解析失败或请求超时。', 'network unavailable, DNS resolution failed, or timeout.')}"
+            )
+            return
+        if status.startswith("no_update:"):
+            latest = status.split(":", 1)[1]
+            self._log(f"{bi('已检查更新，当前已是最新版本', 'Checked update, already latest')}: {latest}")
+            return
+        if status.startswith("update_available:"):
+            latest = status.split(":", 1)[1]
+            self._log(f"{bi('检测到可更新版本', 'Update available')}: {latest}")
 
     def _show_optional_update_dialog(self, info: UpdateInfo) -> None:
         text = (

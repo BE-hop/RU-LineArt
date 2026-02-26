@@ -1,1 +1,13 @@
 .DS_Store
+**/.DS_Store
+**/__pycache__/
+*.pyc
+
+sketch2rhino/desktop_app/build/
+sketch2rhino/desktop_app/build_windows/
+sketch2rhino/desktop_app/dist/
+sketch2rhino/desktop_app/dist_windows/
+sketch2rhino/desktop_app/*.spec
+
+sketch2rhino/desktop_app/release/*
+!sketch2rhino/desktop_app/release/.gitkeep

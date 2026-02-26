@@ -13,7 +13,13 @@ This folder contains a local desktop wrapper for `sketch2rhino`.
 - Choose image manually.
 - Choose output `.3dm` path.
 - Optional custom YAML config.
+- Geometry output mode selector: `直线 / 曲线 / 混合` (`Straight / Curves / Mixed`), default is `曲线 / Curves`.
 - App icon includes `BEhop` and `RU-LineArt`.
+
+## Versioning
+
+- Rule: each software update must bump version and update README notes.
+- Current version: `0.2.4` (2026-02-26)
 
 ## Run locally (development)
 
@@ -120,14 +126,17 @@ Behavior:
 
 1. App requests JSON feed.
 2. If `latest` is newer than current version, it shows an update dialog.
-3. User clicks update, app opens the `page` URL in browser.
-4. If `force: true`, app requires update and exits after prompt.
+3. If `latest` is equal to current version, no popup is shown (this is expected), and a "already latest" log is written.
+4. If network fails or feed JSON is invalid, no popup is shown, and concrete failure reason is written in the log.
+5. If system certificate chain validation fails, app retries with bundled CA certificate file (`assets/cacert.pem`).
+6. User clicks update, app opens the `page` URL in browser.
+7. If `force: true`, app requires update and exits after prompt.
 
 JSON format:
 
 ```json
 {
-  "latest": "1.4.0",
+  "latest": "0.2.4",
   "force": false,
   "page": "https://www.behop.cn/behop-ai-product/products/ru-lineart/",
   "notes": "Bug fixes and quality improvements."

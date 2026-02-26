@@ -10,6 +10,16 @@
 - Manifest: `http://127.0.0.1:8000/tool_manifest.json`
 - Convert API: `POST http://127.0.0.1:8000/convert`
 
+## 版本管理
+
+- 规则：每次软件更新都要递增版本号，并在 README 记录。
+- 当前版本：`0.2.4`（2026-02-26）
+- 本次更新：
+  - 修复打包后更新检查证书回退失效问题（`cacert.pem` 随安装包一起分发）。
+  - 更新检查保持重试机制（每个地址重试 2 次）与备用网址回退（`www` -> 非 `www`）。
+  - 更新失败日志继续显示具体异常原因（例如 DNS/SSL/超时）。
+  - Windows 版继续沿用原 GitHub Actions 工作流：`.github/workflows/build-windows-desktop.yml`。
+
 ## 快速开始
 
 ```bash

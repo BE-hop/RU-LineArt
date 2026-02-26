@@ -3,7 +3,7 @@
 ## Core source folders
 
 - `desktop_app/main.py`
-  - Desktop GUI entrypoint (Chinese/English UI, drag-drop, conversion trigger).
+  - Desktop GUI entrypoint (Chinese/English UI, drag-drop, conversion trigger, geometry mode selector).
 - `desktop_app/assets/icon_candidates/`
   - Source icon design candidates.
   - Current selected icon source: `candidate_a_curve-first.png`.

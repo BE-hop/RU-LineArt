@@ -2,6 +2,16 @@
 
 A local tool that converts a planar sketch image into one or more editable open curves in Rhino.
 
+## Versioning
+
+- Rule: every software update must bump the version and be logged in README.
+- Current version: `0.2.4` (2026-02-26)
+- Latest changes:
+  - Fixed packaged-app TLS fallback by shipping `cacert.pem` inside desktop assets.
+  - Update check keeps retry + fallback URL flow (`8s`, `2` attempts, `www` -> non-`www`).
+  - Update failure logs include concrete exception reason (DNS/SSL/timeout, etc).
+  - Windows packaging still follows GitHub Actions workflow `.github/workflows/build-windows-desktop.yml`.
+
 ## What it does
 Input:
 - A sketch image containing one or more contour strokes (can be jittery, messy, varying thickness).
