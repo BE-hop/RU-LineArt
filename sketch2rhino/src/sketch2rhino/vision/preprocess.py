@@ -53,7 +53,9 @@ def _binarize(gray: np.ndarray, cfg: PreprocessConfig) -> np.ndarray:
         work = cv2.bitwise_not(work)
 
     if cfg.binarize.method == "otsu":
-        _, binary = cv2.threshold(work, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+        otsu_t, _ = cv2.threshold(work, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        t = float(np.clip(float(otsu_t) + float(getattr(cfg.binarize, "otsu_offset", 0.0)), 0.0, 255.0))
+        _, binary = cv2.threshold(work, t, 255, cv2.THRESH_BINARY_INV)
         return binary
 
     block_size = int(cfg.binarize.block_size)
@@ -76,6 +78,8 @@ def _morph_cleanup(binary: np.ndarray, cfg: PreprocessConfig) -> np.ndarray:
     kernel = np.ones((3, 3), dtype=np.uint8)
     out = binary.copy()
 
+    if cfg.morph.erode_iter > 0:
+        out = cv2.erode(out, kernel, iterations=cfg.morph.erode_iter)
     if cfg.morph.close_iter > 0:
         out = cv2.morphologyEx(out, cv2.MORPH_CLOSE, kernel, iterations=cfg.morph.close_iter)
     if cfg.morph.open_iter > 0:

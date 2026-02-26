@@ -6,7 +6,7 @@ from typing import Any
 
 import cv2
 
-from sketch2rhino.types import BinaryImage, NurbsSpec, Polyline2D, SkeletonImage
+from sketch2rhino.types import BinaryImage, CurveGeometry, NurbsSpec, Polyline2D, SkeletonImage
 
 
 def ensure_debug_dir(path: str | Path) -> Path:
@@ -36,29 +36,31 @@ def save_polyline_json(polyline: Polyline2D | list[Polyline2D], out_path: str | 
     Path(out_path).write_text(json.dumps(data, indent=2), encoding="utf-8")
 
 
-def save_nurbs_json(spec: NurbsSpec | list[NurbsSpec], out_path: str | Path) -> None:
-    if isinstance(spec, list):
-        data: dict[str, Any] = {
-            "curves": [
-                {
-                    "degree": s.degree,
-                    "control_points": s.control_points,
-                    "control_points_count": len(s.control_points),
-                    "knots": s.knots,
-                    "weights": s.weights,
-                }
-                for s in spec
-            ],
-            "count": len(spec),
-        }
-    else:
-        data = {
+def _curve_payload(spec: CurveGeometry) -> dict[str, Any]:
+    if isinstance(spec, NurbsSpec):
+        return {
+            "geometry_type": "nurbs",
             "degree": spec.degree,
             "control_points": spec.control_points,
             "control_points_count": len(spec.control_points),
             "knots": spec.knots,
             "weights": spec.weights,
         }
+    return {
+        "geometry_type": "polyline",
+        "points": spec.points,
+        "points_count": len(spec.points),
+    }
+
+
+def save_nurbs_json(spec: CurveGeometry | list[CurveGeometry], out_path: str | Path) -> None:
+    if isinstance(spec, list):
+        data: dict[str, Any] = {
+            "curves": [_curve_payload(s) for s in spec],
+            "count": len(spec),
+        }
+    else:
+        data = _curve_payload(spec)
     Path(out_path).write_text(json.dumps(data, indent=2), encoding="utf-8")
 
 

@@ -45,6 +45,9 @@ class NurbsSpec:
     weights: list[float] | None = None
 
 
+CurveGeometry: TypeAlias = NurbsSpec | Polyline2D
+
+
 @dataclass(slots=True)
 class ExportResult:
     output_path: Path

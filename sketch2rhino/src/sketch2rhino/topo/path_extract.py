@@ -291,6 +291,19 @@ def _edge_outward_direction(edge: _SuperEdge, node: int, centers: dict[int, tupl
 def _build_continuation_map(super_graph: _SuperGraph, cfg: PathExtractConfig) -> dict[tuple[int, int], int]:
     continuation: dict[tuple[int, int], int] = {}
     tangent_k = int(getattr(cfg, "tangent_k", 10))
+    policy = str(getattr(cfg, "crossing_policy", "overpass")).strip().lower()
+
+    if policy in {"junction_split", "split"}:
+        # Preserve chain continuity on simple degree-2 nodes, but break at
+        # branching junctions (degree >= 3) to avoid wrong straight-through
+        # links in dense regions.
+        for node, eids in super_graph.incident.items():
+            if len(eids) != 2:
+                continue
+            e1, e2 = eids
+            continuation[(node, e1)] = e2
+            continuation[(node, e2)] = e1
+        return continuation
 
     def edge_pair_score(node: int, e1: int, e2: int) -> float:
         v1 = _edge_outward_direction(super_graph.edges[e1], node, super_graph.centers, tangent_k)

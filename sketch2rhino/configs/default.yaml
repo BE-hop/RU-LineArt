@@ -8,7 +8,9 @@ preprocess:
     method: "otsu"    # or "adaptive"
     block_size: 31
     C: 7
+    otsu_offset: 0
   morph:
+    erode_iter: 0
     close_iter: 0
     open_iter: 0
 
@@ -26,8 +28,35 @@ path_extract:
   tangent_k: 10
 
 fit:
+  geometry_mode: "mixed"  # "mixed" | "polyline_only" | "nurbs_only"
   degree: 3
   max_control_points: 50
+  segment:
+    enable: true
+    window_points: 9
+    corner_split_angle_deg: 45.0
+    corner_resample_step_px: 2.0
+    corner_scales_px: [6.0, 12.0, 24.0]
+    corner_multiscale_ratio: 0.65
+    corner_min_scales_hit: 2
+    corner_region_gap_points: 1
+    fillet_enable: true
+    fillet_line_window_points: 6
+    fillet_line_residual_px: 1.0
+    fillet_circle_residual_px: 1.5
+    fillet_min_turn_deg: 35.0
+    fillet_max_turn_deg: 170.0
+    fillet_radius_min_px: 2.0
+    fillet_radius_max_px: 2000.0
+    fillet_max_span_px: 80.0
+    break_merge_distance_px: 2.0
+    straight_min_chord_px: 12.0
+    straight_max_deviation_px: 2.0
+    straight_max_deviation_ratio: 0.02
+    straight_max_turn_deg: 12.0
+    min_segment_points: 3
+    forced_break_tolerance_px: 3.0
+    endpoint_snap_tolerance_px: 2.5
   stabilize:
     enable: false
     method: "savgol"
@@ -44,6 +73,7 @@ fit:
     smooth_window: 7
     smooth_passes: 1
   spline:
+    mode: "auto"        # "auto" | "smooth" | "hard_edge"
     smoothing: 6.0      # balanced: reduce jitter while preserving shape
     max_iter: 6
     fallback_if_fail: true
@@ -54,6 +84,16 @@ fit:
     anchor_neighbor_weight: 6.0
     anchor_refit_max_iter: 2
     anchor_sample_count: 400
+    hard_edge_corner_angle_deg: 45.0
+    hard_edge_right_angle_tolerance_deg: 30.0
+    hard_edge_min_corners: 3
+    hard_edge_max_vertices: 20
+    hard_edge_corner_ratio_min: 0.35
+    hard_edge_right_angle_ratio_min: 0.4
+    hard_edge_straight_min_length_px: 20.0
+    hard_edge_straight_max_deviation_px: 2.0
+    hard_edge_straight_max_deviation_ratio: 0.02
+    hard_edge_straight_max_turn_deg: 12.0
 
 export:
   plane: "XY"

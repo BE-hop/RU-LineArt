@@ -1,0 +1,20 @@
+{
+  "name": "RU-LineArt",
+  "service": "RU-LineArt API",
+  "provider": "BEhop",
+  "author": "BEhop Design AI Lab",
+  "url": "https://behop.cn",
+  "version": "0.1.0",
+  "endpoint": "http://127.0.0.1:8000",
+  "openapi": "http://127.0.0.1:8000/openapi.json",
+  "health": "http://127.0.0.1:8000/health",
+  "tools": [
+    {
+      "name": "convert",
+      "method": "POST",
+      "path": "/convert",
+      "description": "Convert sketch image to Rhino 3dm file",
+      "url": "http://127.0.0.1:8000/convert"
+    }
+  ]
+}

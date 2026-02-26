@@ -1,11 +1,17 @@
 from __future__ import annotations
 
+import json
+import os
+import re
 import sys
 import traceback
+import urllib.error
+import urllib.request
+from dataclasses import dataclass
 from pathlib import Path
 
-from PySide6.QtCore import QThread, Qt, Signal
-from PySide6.QtGui import QIcon
+from PySide6.QtCore import QThread, Qt, QUrl, Signal
+from PySide6.QtGui import QDesktopServices, QIcon
 from PySide6.QtWidgets import (
     QApplication,
     QFileDialog,
@@ -33,11 +39,15 @@ def _ensure_import_path() -> None:
 
 _ensure_import_path()
 
+from sketch2rhino import __version__  # noqa: E402
 from sketch2rhino.config import load_config  # noqa: E402
 from sketch2rhino.pipeline import run_pipeline  # noqa: E402
 
 
 IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".webp"}
+DEFAULT_UPDATE_FEED_URL = "https://www.behop.cn/behop-ai-product/products/ru-lineart/version.json"
+DEFAULT_UPDATE_PAGE_URL = "https://www.behop.cn/behop-ai-product/products/ru-lineart/"
+UPDATE_CHECK_TIMEOUT_SEC = 3.0
 
 
 def is_image_file(path: Path) -> bool:
@@ -46,6 +56,74 @@ def is_image_file(path: Path) -> bool:
 
 def bi(zh: str, en: str) -> str:
     return f"{zh} / {en}"
+
+
+@dataclass(frozen=True)
+class UpdateInfo:
+    latest: str
+    page: str
+    force: bool
+    notes: str
+
+
+def update_feed_url() -> str:
+    custom = os.environ.get("RU_LINEART_UPDATE_JSON_URL", "").strip()
+    return custom or DEFAULT_UPDATE_FEED_URL
+
+
+def _version_parts(raw: str) -> tuple[int, ...]:
+    nums = [int(v) for v in re.findall(r"\d+", raw)]
+    return tuple(nums)
+
+
+def is_newer_version(candidate: str, current: str) -> bool:
+    c1 = list(_version_parts(candidate))
+    c2 = list(_version_parts(current))
+    if not c1 or not c2:
+        return False
+    size = max(len(c1), len(c2))
+    c1.extend([0] * (size - len(c1)))
+    c2.extend([0] * (size - len(c2)))
+    return tuple(c1) > tuple(c2)
+
+
+def _parse_update_info(data: dict[str, object]) -> UpdateInfo | None:
+    latest = str(data.get("latest", "")).strip()
+    if not latest:
+        return None
+
+    page = str(data.get("page", "")).strip() or DEFAULT_UPDATE_PAGE_URL
+    force_raw = data.get("force", False)
+    if isinstance(force_raw, bool):
+        force = force_raw
+    elif isinstance(force_raw, (int, float)):
+        force = bool(force_raw)
+    elif isinstance(force_raw, str):
+        force = force_raw.strip().lower() in {"1", "true", "yes", "y", "on"}
+    else:
+        force = False
+
+    notes = str(data.get("notes", "")).strip()
+    if not notes:
+        zh = str(data.get("notes_zh", "")).strip()
+        en = str(data.get("notes_en", "")).strip()
+        if zh or en:
+            notes = bi(zh or "-", en or "-")
+
+    return UpdateInfo(latest=latest, page=page, force=force, notes=notes)
+
+
+def fetch_update_info(feed_url: str) -> UpdateInfo | None:
+    request = urllib.request.Request(
+        feed_url,
+        headers={"User-Agent": f"RU-LineArt/{__version__}"},
+    )
+    with urllib.request.urlopen(request, timeout=UPDATE_CHECK_TIMEOUT_SEC) as resp:
+        payload = resp.read().decode("utf-8")
+    parsed = json.loads(payload)
+    if not isinstance(parsed, dict):
+        return None
+    return _parse_update_info(parsed)
 
 
 def default_config_path() -> Path | None:
@@ -96,6 +174,26 @@ class ConvertWorker(QThread):
             self.failed.emit(traceback.format_exc())
 
 
+class UpdateCheckWorker(QThread):
+    found = Signal(object)
+
+    def __init__(self, current_version: str, feed_url: str) -> None:
+        super().__init__()
+        self.current_version = current_version
+        self.feed_url = feed_url
+
+    def run(self) -> None:  # noqa: D401
+        try:
+            info = fetch_update_info(self.feed_url)
+            if info is None:
+                return
+            if is_newer_version(info.latest, self.current_version):
+                self.found.emit(info)
+        except (urllib.error.URLError, TimeoutError, OSError, ValueError):
+            # Network or JSON errors should not block app startup.
+            return
+
+
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
@@ -108,6 +206,8 @@ class MainWindow(QMainWindow):
             self.setWindowIcon(QIcon(str(icon_path)))
 
         self.worker: ConvertWorker | None = None
+        self.update_worker: UpdateCheckWorker | None = None
+        self.current_version = __version__
         self._build_ui()
 
     def _build_ui(self) -> None:
@@ -186,6 +286,16 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.log_edit, 1)
 
         self.setCentralWidget(root)
+
+    def check_update_on_startup(self) -> None:
+        feed_url = update_feed_url()
+        self.update_worker = UpdateCheckWorker(current_version=self.current_version, feed_url=feed_url)
+        self.update_worker.found.connect(self._on_update_found)
+        self.update_worker.start()
+        self._log(
+            f"{bi('当前版本', 'Current version')}: {self.current_version} | "
+            f"{bi('更新源', 'Update feed')}: {feed_url}"
+        )
 
     def _pick_image(self) -> None:
         path, _ = QFileDialog.getOpenFileName(
@@ -278,6 +388,65 @@ class MainWindow(QMainWindow):
             bi("转换失败，请查看日志详情。", "Conversion failed. See logs for details."),
         )
 
+    def _on_update_found(self, payload: object) -> None:
+        if not isinstance(payload, UpdateInfo):
+            return
+
+        if payload.force:
+            self._show_force_update_dialog(payload)
+        else:
+            self._show_optional_update_dialog(payload)
+
+    def _show_optional_update_dialog(self, info: UpdateInfo) -> None:
+        text = (
+            f"{bi('发现新版本', 'New version found')}: {info.latest}\n"
+            f"{bi('当前版本', 'Current version')}: {self.current_version}"
+        )
+        if info.notes:
+            text = f"{text}\n\n{bi('更新说明', 'Release notes')}:\n{info.notes}"
+
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Information)
+        box.setWindowTitle(bi("发现更新", "Update available"))
+        box.setText(text)
+        open_btn = box.addButton(bi("前往官网更新", "Open update page"), QMessageBox.AcceptRole)
+        box.addButton(bi("稍后", "Later"), QMessageBox.RejectRole)
+        box.exec()
+        if box.clickedButton() == open_btn:
+            self._open_update_page(info.page)
+
+    def _show_force_update_dialog(self, info: UpdateInfo) -> None:
+        text = (
+            f"{bi('发现必须更新版本', 'A required update is available')}: {info.latest}\n"
+            f"{bi('当前版本', 'Current version')}: {self.current_version}\n\n"
+            f"{bi('请先更新后再继续使用。', 'Please update before continuing.')}"
+        )
+        if info.notes:
+            text = f"{text}\n\n{bi('更新说明', 'Release notes')}:\n{info.notes}"
+
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Warning)
+        box.setWindowTitle(bi("必须更新", "Update required"))
+        box.setText(text)
+        open_btn = box.addButton(bi("前往官网更新", "Open update page"), QMessageBox.AcceptRole)
+        box.addButton(bi("退出软件", "Quit"), QMessageBox.RejectRole)
+        box.exec()
+        if box.clickedButton() == open_btn:
+            self._open_update_page(info.page)
+        app = QApplication.instance()
+        if app is not None:
+            app.quit()
+
+    def _open_update_page(self, page_url: str) -> None:
+        if QDesktopServices.openUrl(QUrl(page_url)):
+            self._log(f"{bi('已打开更新页面', 'Opened update page')}: {page_url}")
+            return
+        QMessageBox.warning(
+            self,
+            bi("打开失败", "Open failed"),
+            f"{bi('无法打开更新页面', 'Could not open update page')}: {page_url}",
+        )
+
     def _log(self, text: str) -> None:
         self.log_edit.appendPlainText(text)
 
@@ -309,6 +478,7 @@ def main() -> int:
         app.setWindowIcon(QIcon(str(icon_path)))
     window = MainWindow()
     window.show()
+    window.check_update_on_startup()
     return app.exec()
 
 

@@ -27,6 +27,11 @@ fi
   --specpath "$APP_DIR" \
   "$APP_DIR/main.py"
 
+cp "$ROOT_DIR/tool_manifest.json" "$APP_DIR/dist/tool_manifest.json"
+cp "$ROOT_DIR/README_AI.md" "$APP_DIR/dist/README_AI.md"
+
 echo
 echo "Build complete:"
 echo "  $APP_DIR/dist/$APP_NAME.app"
+echo "  $APP_DIR/dist/tool_manifest.json"
+echo "  $APP_DIR/dist/README_AI.md"

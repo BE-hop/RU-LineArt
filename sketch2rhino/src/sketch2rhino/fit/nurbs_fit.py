@@ -66,6 +66,210 @@ def _fallback_spec(points: np.ndarray, degree: int, max_control_points: int) -> 
     )
 
 
+def _point_line_distance(point: np.ndarray, start: np.ndarray, end: np.ndarray) -> float:
+    line = end - start
+    norm = float(np.linalg.norm(line))
+    if norm == 0.0:
+        return float(np.linalg.norm(point - start))
+    return float(np.abs(np.cross(line, point - start)) / norm)
+
+
+def _rdp(points: np.ndarray, epsilon: float) -> np.ndarray:
+    if len(points) < 3:
+        return points
+
+    start = points[0]
+    end = points[-1]
+    max_dist = -1.0
+    split_idx = -1
+
+    for i in range(1, len(points) - 1):
+        d = _point_line_distance(points[i], start, end)
+        if d > max_dist:
+            max_dist = d
+            split_idx = i
+
+    if max_dist <= float(epsilon):
+        return np.vstack([start, end])
+
+    left = _rdp(points[: split_idx + 1], epsilon)
+    right = _rdp(points[split_idx:], epsilon)
+    return np.vstack([left[:-1], right])
+
+
+def _reduce_points_to_budget(points: np.ndarray, max_points: int) -> np.ndarray:
+    if len(points) <= max_points:
+        return points
+
+    budget = max(2, int(max_points))
+    bbox_min = points.min(axis=0)
+    bbox_max = points.max(axis=0)
+    diag = float(np.linalg.norm(bbox_max - bbox_min))
+    low = 0.0
+    high = max(1.0, diag)
+    best: np.ndarray | None = None
+
+    for _ in range(24):
+        mid = 0.5 * (low + high)
+        candidate = _rdp(points, mid)
+        if len(candidate) > budget:
+            low = mid
+        else:
+            best = candidate
+            high = mid
+
+    if best is None:
+        best = _rdp(points, high)
+
+    if len(best) > budget:
+        best = _resample_by_arclength(points, budget)
+    return best
+
+
+def _hard_edge_spec(points: np.ndarray, max_control_points: int) -> NurbsSpec:
+    control = _reduce_points_to_budget(points, max_control_points)
+    if len(control) < 2:
+        control = _resample_by_arclength(points, 2)
+    knots = _clamped_uniform_knots(len(control), degree=1)
+    return NurbsSpec(
+        degree=1,
+        control_points=[(float(x), float(y)) for x, y in control],
+        knots=knots,
+        weights=None,
+    )
+
+
+def _is_near_straight(points: np.ndarray, cfg: FitConfig) -> bool:
+    if len(points) < 2:
+        return False
+
+    start = points[0]
+    end = points[-1]
+    chord = float(np.linalg.norm(end - start))
+    if chord <= 1e-6:
+        return False
+
+    seg_min = float(getattr(cfg.segment, "straight_min_chord_px", cfg.spline.hard_edge_straight_min_length_px))
+    min_length = max(1.0, min(float(cfg.spline.hard_edge_straight_min_length_px), seg_min))
+    short_candidate = False
+    if chord < min_length:
+        # For small segments (typical rectangle edges after splitting), allow a
+        # stricter short-line gate instead of rejecting immediately.
+        if len(points) <= 8:
+            short_candidate = True
+        else:
+            return False
+
+    max_dev = 0.0
+    if len(points) > 2:
+        max_dev = max(_point_line_distance(p, start, end) for p in points[1:-1])
+    dev_limit = max(
+        float(cfg.spline.hard_edge_straight_max_deviation_px),
+        float(cfg.spline.hard_edge_straight_max_deviation_ratio) * chord,
+    )
+    if short_candidate:
+        dev_limit = min(dev_limit, 0.8)
+    if max_dev > dev_limit:
+        return False
+
+    seg = np.diff(points, axis=0)
+    seg_len = np.linalg.norm(seg, axis=1)
+    valid = seg_len > 1e-6
+    seg = seg[valid]
+    seg_len = seg_len[valid]
+    if len(seg) < 2:
+        return True
+
+    unit = seg / seg_len[:, None]
+    dots = np.sum(unit[:-1] * unit[1:], axis=1)
+    dots = np.clip(dots, -1.0, 1.0)
+    turns = np.degrees(np.arccos(dots))
+    if len(turns) == 0:
+        return True
+
+    turn_limit = max(1.0, float(cfg.spline.hard_edge_straight_max_turn_deg))
+    if short_candidate:
+        turn_limit = min(turn_limit, 10.0)
+    return float(np.percentile(turns, 95.0)) <= turn_limit
+
+
+def _should_use_hard_edge(points: np.ndarray, cfg: FitConfig) -> bool:
+    mode = str(getattr(cfg.spline, "mode", "auto")).strip().lower()
+    if mode == "hard_edge":
+        return True
+    if mode == "smooth":
+        return False
+    if mode != "auto":
+        return False
+
+    if _is_near_straight(points, cfg):
+        return True
+
+    if len(points) < 4:
+        return False
+
+    seg = np.diff(points, axis=0)
+    seg_len = np.linalg.norm(seg, axis=1)
+    valid = seg_len > 1e-6
+    seg = seg[valid]
+    seg_len = seg_len[valid]
+    if len(seg) < 3:
+        return False
+
+    unit = seg / seg_len[:, None]
+    dots = np.sum(unit[:-1] * unit[1:], axis=1)
+    dots = np.clip(dots, -1.0, 1.0)
+    angles = np.degrees(np.arccos(dots))
+    if len(angles) == 0:
+        return False
+
+    corner_min = max(5.0, float(cfg.spline.hard_edge_corner_angle_deg))
+    corner_mask = angles >= corner_min
+    corner_count = int(np.count_nonzero(corner_mask))
+    if corner_count < max(1, int(cfg.spline.hard_edge_min_corners)):
+        return False
+
+    right_tol = max(5.0, float(cfg.spline.hard_edge_right_angle_tolerance_deg))
+    right_count = int(np.count_nonzero(np.abs(angles[corner_mask] - 90.0) <= right_tol))
+    right_ratio = float(right_count / corner_count) if corner_count > 0 else 0.0
+    corner_ratio = float(corner_count / max(1, len(angles)))
+
+    max_vertices = max(4, int(cfg.spline.hard_edge_max_vertices))
+    right_ratio_min = float(cfg.spline.hard_edge_right_angle_ratio_min)
+    corner_ratio_min = float(cfg.spline.hard_edge_corner_ratio_min)
+
+    return right_ratio >= right_ratio_min and (
+        len(points) <= max_vertices or corner_ratio >= corner_ratio_min
+    )
+
+
+def should_use_polyline_geometry(polyline: Polyline2D, cfg: FitConfig) -> bool:
+    points = _remove_duplicate_neighbors(polyline.as_array())
+    if len(points) < 2:
+        return False
+    return _should_use_hard_edge(points, cfg)
+
+
+def fit_open_polyline(polyline: Polyline2D, cfg: FitConfig) -> Polyline2D:
+    points = _remove_duplicate_neighbors(polyline.as_array())
+    if len(points) < 2:
+        raise ValueError("Polyline has fewer than 2 valid points")
+
+    # Export near-straight long segments as true two-point line-like polylines.
+    chord = float(np.linalg.norm(points[-1] - points[0]))
+    seg_min = float(getattr(cfg.segment, "straight_min_chord_px", cfg.spline.hard_edge_straight_min_length_px))
+    collapse_min = max(8.0, min(float(cfg.spline.hard_edge_straight_min_length_px), seg_min))
+    if len(points) >= 5 and chord >= collapse_min and _is_near_straight(points, cfg):
+        p0 = (float(points[0, 0]), float(points[0, 1]))
+        p1 = (float(points[-1, 0]), float(points[-1, 1]))
+        return Polyline2D(points=[p0, p1])
+
+    reduced = _reduce_points_to_budget(points, max(2, int(cfg.max_control_points)))
+    if len(reduced) < 2:
+        reduced = _resample_by_arclength(points, 2)
+    return Polyline2D(points=[(float(x), float(y)) for x, y in reduced])
+
+
 def _controls_reasonable(control_points: list[tuple[float, float]], ref_points: np.ndarray) -> bool:
     if not control_points:
         return False
@@ -168,6 +372,9 @@ def fit_open_nurbs(
     points = _remove_duplicate_neighbors(polyline.as_array())
     if len(points) < 2:
         raise ValueError("Polyline has fewer than 2 valid points")
+
+    if _should_use_hard_edge(points, cfg):
+        return _hard_edge_spec(points, max_control_points=cfg.max_control_points)
 
     if len(points) < cfg.degree + 1:
         degree = max(1, len(points) - 1)

@@ -37,6 +37,10 @@ if ($PythonBin -ne "python" -and -not (Test-Path $PythonBin)) {
     --specpath "$AppDir" `
     "$AppDir\main.py"
 
+$DistAppDir = Join-Path "$AppDir\dist_windows" "$AppName"
+Copy-Item "$RootDir\tool_manifest.json" (Join-Path $DistAppDir "tool_manifest.json") -Force
+Copy-Item "$RootDir\README_AI.md" (Join-Path $DistAppDir "README_AI.md") -Force
+
 $ReleaseDir = Join-Path $AppDir "release"
 New-Item -ItemType Directory -Force -Path $ReleaseDir | Out-Null
 
@@ -49,5 +53,5 @@ Compress-Archive -Path "$AppDir\dist_windows\$AppName" -DestinationPath $ZipPath
 
 Write-Host ""
 Write-Host "Build complete:"
-Write-Host "  EXE folder: $AppDir\dist_windows\$AppName"
+Write-Host "  EXE folder: $DistAppDir"
 Write-Host "  ZIP: $ZipPath"

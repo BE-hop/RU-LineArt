@@ -35,6 +35,13 @@ Expected output:
 
 `/Users/mac/Documents/RU-LineArt/sketch2rhino/desktop_app/dist/RU-LineArt.app`
 
+The macOS dist folder also includes:
+
+- `/Users/mac/Documents/RU-LineArt/sketch2rhino/desktop_app/dist/tool_manifest.json`
+- `/Users/mac/Documents/RU-LineArt/sketch2rhino/desktop_app/dist/README_AI.md`
+
+These files help agents discover and call the local API quickly.
+
 ## Icon customization
 
 - Selected icon source (A): `/Users/mac/Documents/RU-LineArt/sketch2rhino/desktop_app/assets/icon_candidates/candidate_a_curve-first.png`
@@ -73,6 +80,8 @@ Output:
 
 `desktop_app\release\RU-LineArt-windows.zip`
 
+The packaged Windows output includes `tool_manifest.json` and `README_AI.md` next to `RU-LineArt.exe` before zipping.
+
 GitHub Actions:
 
 - Workflow file: `/Users/mac/Documents/RU-LineArt/.github/workflows/build-windows-desktop.yml`
@@ -98,3 +107,33 @@ chmod +x desktop_app/clean_artifacts.sh
 - Build on macOS for macOS users.
 - Build on Windows for Windows users (cross-platform build is not recommended for desktop apps).
 - If you want notarized/signable macOS distribution, add code signing in a separate release step.
+
+## Semi-auto update check (launch-time)
+
+The desktop app now checks a remote JSON feed every time it starts.
+
+- Feed URL (default): `https://www.behop.cn/behop-ai-product/products/ru-lineart/version.json`
+- Product page fallback: `https://www.behop.cn/behop-ai-product/products/ru-lineart/`
+- Local test override: set env var `RU_LINEART_UPDATE_JSON_URL`
+
+Behavior:
+
+1. App requests JSON feed.
+2. If `latest` is newer than current version, it shows an update dialog.
+3. User clicks update, app opens the `page` URL in browser.
+4. If `force: true`, app requires update and exits after prompt.
+
+JSON format:
+
+```json
+{
+  "latest": "1.4.0",
+  "force": false,
+  "page": "https://www.behop.cn/behop-ai-product/products/ru-lineart/",
+  "notes": "Bug fixes and quality improvements."
+}
+```
+
+Example file:
+
+- `/Users/mac/Documents/RU-LineArt/sketch2rhino/desktop_app/update_feed.example.json`

@@ -6,6 +6,7 @@ from time import perf_counter
 import numpy as np
 from scipy.interpolate import BSpline
 
+from sketch2rhino.brand import brand_signature
 from sketch2rhino.config import AppConfig
 from sketch2rhino.debug.artifacts import (
     ensure_debug_dir,
@@ -17,8 +18,9 @@ from sketch2rhino.debug.artifacts import (
 )
 from sketch2rhino.debug.overlays import save_path_overlay
 from sketch2rhino.export.rhino3dm_writer import write_3dm, write_3dm_many
-from sketch2rhino.fit.nurbs_fit import fit_open_nurbs
+from sketch2rhino.fit.nurbs_fit import fit_open_nurbs, fit_open_polyline, should_use_polyline_geometry
 from sketch2rhino.fit.polyline_simplify import simplify_polyline
+from sketch2rhino.fit.segment_split import anchors_for_segment, snap_segment_endpoints, split_polyline_into_segments
 from sketch2rhino.fit.stroke_stabilize import stabilize_polyline
 from sketch2rhino.topo.graph_build import build_stroke_graph
 from sketch2rhino.topo.path_extract import (
@@ -28,7 +30,7 @@ from sketch2rhino.topo.path_extract import (
     extract_open_paths,
     split_components,
 )
-from sketch2rhino.types import ExportResult, NurbsSpec, Polyline2D
+from sketch2rhino.types import CurveGeometry, ExportResult, NurbsSpec, Polyline2D
 from sketch2rhino.vision.preprocess import load_grayscale_image, preprocess_image
 from sketch2rhino.vision.skeletonize import skeletonize_image
 
@@ -37,6 +39,20 @@ def _polyline_length(polyline: Polyline2D) -> float:
     if len(arr) < 2:
         return 0.0
     return float(np.linalg.norm(np.diff(arr, axis=0), axis=1).sum())
+
+
+def _geometry_point_count(geometry: CurveGeometry) -> int:
+    if isinstance(geometry, NurbsSpec):
+        return len(geometry.control_points)
+    return len(geometry.points)
+
+
+def _polyline_has_2_unique_points(polyline: Polyline2D, tol: float = 1e-6) -> bool:
+    arr = polyline.as_array()
+    if len(arr) < 2:
+        return False
+    d = np.linalg.norm(np.diff(arr, axis=0), axis=1)
+    return bool(np.any(d > float(tol)))
 
 
 def _snap_and_collect_protected_points(
@@ -140,13 +156,28 @@ def _anchor_error_stats(
     }
 
 
+def _fit_geometry_for_segment(
+    polyline: Polyline2D,
+    anchors: list[tuple[float, float]],
+    cfg: AppConfig,
+) -> tuple[CurveGeometry, str]:
+    mode = str(cfg.fit.geometry_mode).strip().lower()
+    if mode == "polyline_only":
+        return fit_open_polyline(polyline, cfg.fit), "polyline"
+    if mode == "nurbs_only":
+        return fit_open_nurbs(polyline, cfg.fit, anchors=anchors), "nurbs"
+    if should_use_polyline_geometry(polyline, cfg.fit):
+        return fit_open_polyline(polyline, cfg.fit), "polyline"
+    return fit_open_nurbs(polyline, cfg.fit, anchors=anchors), "nurbs"
+
+
 def run_pipeline(
     image_path: Path,
     output_path: Path,
     cfg: AppConfig,
     debug_dir: Path | None = None,
 ) -> ExportResult:
-    report: dict[str, object] = {"warnings": [], "timings": {}}
+    report: dict[str, object] = {"warnings": [], "timings": {}, "brand": brand_signature()}
 
     t0 = perf_counter()
     gray = load_grayscale_image(image_path)
@@ -230,41 +261,152 @@ def run_pipeline(
         )
         for i, polyline in enumerate(stabilized_list)
     ]
-    anchor_lists = [
-        _polyline_anchor_points(
-            polyline=simplified_list[i],
+    segment_polylines: list[Polyline2D] = []
+    segment_anchors: list[list[tuple[float, float]]] = []
+    segment_sources: list[tuple[int, int]] = []  # (source_curve_idx, local_segment_idx)
+    for i, polyline in enumerate(simplified_list):
+        base_anchors = _polyline_anchor_points(
+            polyline=polyline,
             protected_points=protected_points[i] if i < len(protected_points) else None,
         )
-        for i in range(len(simplified_list))
-    ]
-    nurbs_list: list[NurbsSpec] = [
-        fit_open_nurbs(polyline, cfg.fit, anchors=anchor_lists[i]) for i, polyline in enumerate(simplified_list)
-    ]
+        segments = split_polyline_into_segments(
+            polyline,
+            cfg.fit.segment,
+            forced_break_points=base_anchors,
+        )
+        for j, seg in enumerate(segments):
+            segment_polylines.append(seg)
+            seg_anchor_candidates = anchors_for_segment(
+                seg,
+                anchors=base_anchors,
+                tolerance_px=float(cfg.fit.segment.forced_break_tolerance_px),
+            )
+            segment_anchors.append(_polyline_anchor_points(seg, seg_anchor_candidates))
+            segment_sources.append((i, j))
+
+    if not segment_polylines:
+        raise ValueError("No valid segments after split")
+
+    node_pairs: list[tuple[int, int]] = [(-1, -1) for _ in segment_polylines]
+    node_centers: list[tuple[float, float]] = []
+    if float(cfg.fit.segment.endpoint_snap_tolerance_px) > 0.0:
+        segment_polylines, node_pairs, node_centers = snap_segment_endpoints(
+            segment_polylines,
+            tolerance_px=float(cfg.fit.segment.endpoint_snap_tolerance_px),
+        )
+        segment_anchors = [
+            _polyline_anchor_points(segment_polylines[i], segment_anchors[i]) for i in range(len(segment_polylines))
+        ]
+
+    filtered_polylines: list[Polyline2D] = []
+    filtered_anchors: list[list[tuple[float, float]]] = []
+    filtered_sources: list[tuple[int, int]] = []
+    filtered_node_pairs: list[tuple[int, int]] = []
+    for i, seg in enumerate(segment_polylines):
+        if not _polyline_has_2_unique_points(seg):
+            continue
+        filtered_polylines.append(seg)
+        filtered_anchors.append(segment_anchors[i])
+        filtered_sources.append(segment_sources[i])
+        filtered_node_pairs.append(node_pairs[i] if i < len(node_pairs) else (-1, -1))
+
+    segment_polylines = filtered_polylines
+    segment_anchors = filtered_anchors
+    segment_sources = filtered_sources
+    node_pairs = filtered_node_pairs
+    if not segment_polylines:
+        raise ValueError("No valid segments after endpoint snap")
+
+    geometry_list: list[CurveGeometry] = []
+    geometry_types: list[str] = []
+    for i, polyline in enumerate(segment_polylines):
+        geometry, geometry_type = _fit_geometry_for_segment(polyline, segment_anchors[i], cfg)
+        geometry_list.append(geometry)
+        geometry_types.append(geometry_type)
     report["timings"]["fit"] = perf_counter() - t4
 
+    node_ids_for_export: list[tuple[int, int]] | None = None
+    if node_pairs and all(a >= 0 and b >= 0 for a, b in node_pairs):
+        node_ids_for_export = node_pairs
+
     t5 = perf_counter()
-    if len(nurbs_list) == 1:
-        export_result = write_3dm(nurbs_list[0], output_path, cfg.export)
-    else:
-        export_result = write_3dm_many(nurbs_list, output_path, cfg.export)
-    report["timings"]["export"] = perf_counter() - t5
-
-    if len(simplified_list) == 1:
-        report["polyline_points"] = len(simplified_list[0].points)
-        report["control_points"] = len(nurbs_list[0].control_points)
-    else:
-        report["polyline_points"] = [len(pl.points) for pl in simplified_list]
-        report["control_points"] = [len(ns.control_points) for ns in nurbs_list]
-        report["curve_count"] = len(nurbs_list)
-
-    anchor_stats = [
-        _anchor_error_stats(
-            spec=nurbs_list[i],
-            anchors=anchor_lists[i],
-            sample_count=int(cfg.fit.spline.anchor_sample_count),
+    if len(geometry_list) == 1:
+        export_result = write_3dm(
+            geometry_list[0],
+            output_path,
+            cfg.export,
+            node_ids=node_ids_for_export[0] if node_ids_for_export else None,
         )
-        for i in range(len(nurbs_list))
-    ]
+    else:
+        export_result = write_3dm_many(geometry_list, output_path, cfg.export, node_ids=node_ids_for_export)
+    report["timings"]["export"] = perf_counter() - t5
+    report["export_info"] = export_result.report
+
+    point_counts = [_geometry_point_count(g) for g in geometry_list]
+    if len(segment_polylines) == 1:
+        report["polyline_points"] = len(segment_polylines[0].points)
+        report["control_points"] = point_counts[0]
+        report["geometry_type"] = geometry_types[0]
+        report["segment_count"] = 1
+    else:
+        report["polyline_points"] = [len(pl.points) for pl in segment_polylines]
+        report["control_points"] = point_counts
+        report["curve_count"] = len(geometry_list)
+        report["geometry_types"] = geometry_types
+        report["segment_count"] = len(segment_polylines)
+    report["nurbs_curve_count"] = int(sum(1 for t in geometry_types if t == "nurbs"))
+    report["polyline_curve_count"] = int(sum(1 for t in geometry_types if t == "polyline"))
+
+    segments_report: list[dict[str, object]] = []
+    for i in range(len(segment_polylines)):
+        start_node, end_node = node_pairs[i] if i < len(node_pairs) else (-1, -1)
+        source_idx, local_idx = segment_sources[i]
+        segments_report.append(
+            {
+                "segment_idx": i,
+                "source_curve_idx": int(source_idx),
+                "local_segment_idx": int(local_idx),
+                "geometry_type": geometry_types[i],
+                "polyline_points": len(segment_polylines[i].points),
+                "curve_points": point_counts[i],
+                "start_node_id": int(start_node),
+                "end_node_id": int(end_node),
+            }
+        )
+    report["segments"] = segments_report
+
+    if node_centers:
+        node_degree: dict[int, int] = {}
+        for s_id, e_id in node_pairs:
+            if s_id >= 0:
+                node_degree[s_id] = node_degree.get(s_id, 0) + 1
+            if e_id >= 0:
+                node_degree[e_id] = node_degree.get(e_id, 0) + 1
+        report["nodes"] = [
+            {"id": i, "x": float(x), "y": float(y), "degree": int(node_degree.get(i, 0))}
+            for i, (x, y) in enumerate(node_centers)
+        ]
+
+    anchor_stats: list[dict[str, object]] = []
+    for i, geom in enumerate(geometry_list):
+        if isinstance(geom, NurbsSpec):
+            stat = _anchor_error_stats(
+                spec=geom,
+                anchors=segment_anchors[i],
+                sample_count=int(cfg.fit.spline.anchor_sample_count),
+            )
+            stat["geometry_type"] = "nurbs"
+            anchor_stats.append(stat)
+        else:
+            anchor_stats.append(
+                {
+                    "geometry_type": "polyline",
+                    "count": len(segment_anchors[i]),
+                    "errors_px": [],
+                    "max_px": 0.0,
+                    "mean_px": 0.0,
+                }
+            )
     report["anchor_error_px"] = {
         "per_curve": anchor_stats,
         "max_px": float(max((s["max_px"] for s in anchor_stats), default=0.0)),
@@ -281,9 +423,22 @@ def run_pipeline(
         dbg = ensure_debug_dir(debug_dir)
         save_binary_png(binary, dbg / "01_binarized.png")
         save_skeleton_png(skeleton, dbg / "02_skeleton.png")
+        # Raw extracted paths (before simplify/split/fitting).
         save_path_overlay(gray, polylines if len(polylines) > 1 else polylines[0], dbg / "03_path_overlay.png")
-        save_polyline_json(simplified_list if len(simplified_list) > 1 else simplified_list[0], dbg / "04_polyline.json")
-        save_nurbs_json(nurbs_list if len(nurbs_list) > 1 else nurbs_list[0], dbg / "05_nurbs.json")
+        # Segment-level paths after simplify + split + endpoint snap.
+        save_path_overlay(
+            gray,
+            segment_polylines if len(segment_polylines) > 1 else segment_polylines[0],
+            dbg / "03_segment_overlay.png",
+        )
+        save_polyline_json(
+            segment_polylines if len(segment_polylines) > 1 else segment_polylines[0],
+            dbg / "04_polyline.json",
+        )
+        save_nurbs_json(
+            geometry_list if len(geometry_list) > 1 else geometry_list[0],
+            dbg / "05_nurbs.json",
+        )
         save_report_json(report, dbg / "report.json")
 
     return ExportResult(output_path=export_result.output_path, report=report)
