@@ -328,14 +328,16 @@ def _window_is_straight(points: np.ndarray, cfg: SegmentConfig) -> bool:
     if chord < max(1.0, float(cfg.straight_min_chord_px)):
         return False
 
-    max_dev = 0.0
-    for p in points[1:-1]:
-        max_dev = max(max_dev, _point_line_distance(p, start, end))
+    dev95 = 0.0
+    if len(points) > 2:
+        dev = np.asarray([_point_line_distance(p, start, end) for p in points[1:-1]], dtype=np.float64)
+        if len(dev) > 0:
+            dev95 = float(np.percentile(dev, 95.0))
     dev_limit = max(
         float(cfg.straight_max_deviation_px),
         float(cfg.straight_max_deviation_ratio) * chord,
     )
-    if max_dev > dev_limit:
+    if dev95 > dev_limit:
         return False
 
     turns: list[float] = []

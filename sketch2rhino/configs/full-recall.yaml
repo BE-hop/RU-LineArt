@@ -1,0 +1,16 @@
+path_extract:
+  choose_component: "all"
+  internal_path_min_length_px: 0.0
+
+skeleton:
+  prune_spurs: false
+
+preprocess:
+  morph:
+    close_iter: 1
+
+output:
+  mode: "multi"
+  multi:
+    min_length_px: 1
+    max_curves: 0

@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 from time import perf_counter
 
+import cv2
 import numpy as np
 from scipy.interpolate import BSpline
 
@@ -171,6 +172,82 @@ def _fit_geometry_for_segment(
     return fit_open_nurbs(polyline, cfg.fit, anchors=anchors), "nurbs"
 
 
+def _filter_multi_output_polylines(
+    candidates: list[Polyline2D],
+    min_length_px: float,
+    max_curves: int,
+    sort_by: str,
+) -> tuple[list[Polyline2D], dict[str, object], list[str]]:
+    raw_count = len(candidates)
+    min_len = max(0.0, float(min_length_px))
+    filtered = [pl for pl in candidates if _polyline_length(pl) >= min_len]
+    dropped_by_min = raw_count - len(filtered)
+
+    if str(sort_by).strip().lower() == "length":
+        filtered.sort(key=_polyline_length, reverse=True)
+
+    before_truncate = len(filtered)
+    max_keep = int(max_curves)
+    if max_keep > 0:
+        filtered = filtered[:max_keep]
+    dropped_by_max = before_truncate - len(filtered)
+
+    stats: dict[str, object] = {
+        "raw_candidate_count": int(raw_count),
+        "min_length_px": float(min_len),
+        "kept_after_min_length": int(before_truncate),
+        "dropped_by_min_length": int(dropped_by_min),
+        "max_curves": int(max_keep),
+        "kept_final_count": int(len(filtered)),
+        "dropped_by_max_curves": int(dropped_by_max),
+    }
+
+    warnings: list[str] = []
+    if dropped_by_min > 0:
+        warnings.append(
+            "polylines filtered by output.multi.min_length_px: "
+            f"{raw_count} -> {before_truncate}"
+        )
+    if dropped_by_max > 0:
+        warnings.append(
+            "polylines truncated by output.multi.max_curves: "
+            f"{before_truncate} -> {len(filtered)}"
+        )
+
+    return filtered, stats, warnings
+
+
+def _polyline_pixel_coverage(
+    polylines: list[Polyline2D],
+    reference_mask: np.ndarray,
+) -> dict[str, object]:
+    ref = reference_mask.astype(bool)
+    total = int(np.count_nonzero(ref))
+    if total <= 0:
+        return {"covered_px": 0, "total_px": 0, "ratio": 0.0}
+
+    canvas = np.zeros(reference_mask.shape, dtype=np.uint8)
+    for pl in polylines:
+        pts: list[tuple[int, int]] = []
+        for x, y in pl.points:
+            col = int(round(x))
+            row = int(round(-y))
+            if 0 <= row < canvas.shape[0] and 0 <= col < canvas.shape[1]:
+                pts.append((col, row))
+        if len(pts) >= 2:
+            arr = np.asarray(pts, dtype=np.int32).reshape((-1, 1, 2))
+            cv2.polylines(canvas, [arr], isClosed=False, color=255, thickness=1)
+        elif len(pts) == 1:
+            cv2.circle(canvas, pts[0], radius=0, color=255, thickness=-1)
+
+    covered = int(np.count_nonzero((canvas > 0) & ref))
+    return {
+        "covered_px": covered,
+        "total_px": total,
+        "ratio": float(covered / total),
+    }
+
+
 def run_pipeline(
     image_path: Path,
     output_path: Path,
@@ -208,25 +285,39 @@ def run_pipeline(
 
     graphs = [build_stroke_graph(comp) for comp in components]
     polylines: list[Polyline2D] = []
+    raw_path_candidates: list[Polyline2D] = []
 
     if mode == "single":
         polylines.append(extract_main_open_path(components[0], graphs[0], cfg.path_extract))
+        raw_path_candidates = list(polylines)
     else:
         for comp, graph in zip(components, graphs, strict=True):
-            polylines.extend(
+            raw_path_candidates.extend(
                 extract_open_paths(
                     skeleton=comp,
                     graph=graph,
                     cfg=cfg.path_extract,
-                    min_length_px=cfg.output.multi.min_length_px,
+                    min_length_px=0.0,
                     max_curves=None,
                     include_loops=cfg.output.multi.include_loops,
                 )
             )
-        if cfg.output.multi.sort_by == "length":
-            polylines.sort(key=_polyline_length, reverse=True)
-        if cfg.output.multi.max_curves > 0:
-            polylines = polylines[: cfg.output.multi.max_curves]
+        polylines, path_stats, path_warnings = _filter_multi_output_polylines(
+            candidates=raw_path_candidates,
+            min_length_px=float(cfg.output.multi.min_length_px),
+            max_curves=int(cfg.output.multi.max_curves),
+            sort_by=str(cfg.output.multi.sort_by),
+        )
+        report["path_extract_stats"] = path_stats
+        report["warnings"].extend(path_warnings)
+        report["path_extract_stats"]["coverage_raw_vs_skeleton"] = _polyline_pixel_coverage(
+            raw_path_candidates,
+            skeleton,
+        )
+        report["path_extract_stats"]["coverage_filtered_vs_skeleton"] = _polyline_pixel_coverage(
+            polylines,
+            skeleton,
+        )
 
     if not polylines:
         raise ValueError("No valid path extracted from skeleton")
@@ -253,18 +344,10 @@ def run_pipeline(
         )
         for i, polyline in enumerate(polylines)
     ]
-    simplified_list = [
-        simplify_polyline(
-            polyline,
-            cfg.fit.simplify,
-            protected_points=protected_points[i] if i < len(protected_points) else None,
-        )
-        for i, polyline in enumerate(stabilized_list)
-    ]
     segment_polylines: list[Polyline2D] = []
     segment_anchors: list[list[tuple[float, float]]] = []
     segment_sources: list[tuple[int, int]] = []  # (source_curve_idx, local_segment_idx)
-    for i, polyline in enumerate(simplified_list):
+    for i, polyline in enumerate(stabilized_list):
         base_anchors = _polyline_anchor_points(
             polyline=polyline,
             protected_points=protected_points[i] if i < len(protected_points) else None,
@@ -275,13 +358,18 @@ def run_pipeline(
             forced_break_points=base_anchors,
         )
         for j, seg in enumerate(segments):
-            segment_polylines.append(seg)
             seg_anchor_candidates = anchors_for_segment(
                 seg,
                 anchors=base_anchors,
                 tolerance_px=float(cfg.fit.segment.forced_break_tolerance_px),
             )
-            segment_anchors.append(_polyline_anchor_points(seg, seg_anchor_candidates))
+            seg_simplified = simplify_polyline(
+                seg,
+                cfg.fit.simplify,
+                protected_points=seg_anchor_candidates,
+            )
+            segment_polylines.append(seg_simplified)
+            segment_anchors.append(_polyline_anchor_points(seg_simplified, seg_anchor_candidates))
             segment_sources.append((i, j))
 
     if not segment_polylines:
@@ -302,8 +390,15 @@ def run_pipeline(
     filtered_anchors: list[list[tuple[float, float]]] = []
     filtered_sources: list[tuple[int, int]] = []
     filtered_node_pairs: list[tuple[int, int]] = []
+    min_seg_len = max(0.0, float(cfg.fit.segment.min_length_px))
+    dropped_by_min_seg_len = 0
+    dropped_degenerate = 0
     for i, seg in enumerate(segment_polylines):
         if not _polyline_has_2_unique_points(seg):
+            dropped_degenerate += 1
+            continue
+        if min_seg_len > 0.0 and _polyline_length(seg) < min_seg_len:
+            dropped_by_min_seg_len += 1
             continue
         filtered_polylines.append(seg)
         filtered_anchors.append(segment_anchors[i])
@@ -314,6 +409,16 @@ def run_pipeline(
     segment_anchors = filtered_anchors
     segment_sources = filtered_sources
     node_pairs = filtered_node_pairs
+    report["segment_filter_stats"] = {
+        "min_length_px": float(min_seg_len),
+        "dropped_by_min_length": int(dropped_by_min_seg_len),
+        "dropped_degenerate": int(dropped_degenerate),
+    }
+    if dropped_by_min_seg_len > 0:
+        report["warnings"].append(
+            "segments filtered by fit.segment.min_length_px: "
+            f"-{dropped_by_min_seg_len}"
+        )
     if not segment_polylines:
         raise ValueError("No valid segments after endpoint snap")
 
@@ -423,9 +528,16 @@ def run_pipeline(
         dbg = ensure_debug_dir(debug_dir)
         save_binary_png(binary, dbg / "01_binarized.png")
         save_skeleton_png(skeleton, dbg / "02_skeleton.png")
+        if mode == "multi" and raw_path_candidates:
+            # Candidate paths before min_length/max_curves filtering.
+            save_path_overlay(
+                gray,
+                raw_path_candidates if len(raw_path_candidates) > 1 else raw_path_candidates[0],
+                dbg / "03_path_overlay_raw.png",
+            )
         # Raw extracted paths (before simplify/split/fitting).
         save_path_overlay(gray, polylines if len(polylines) > 1 else polylines[0], dbg / "03_path_overlay.png")
-        # Segment-level paths after simplify + split + endpoint snap.
+        # Segment-level paths after split + per-segment simplify + endpoint snap.
         save_path_overlay(
             gray,
             segment_polylines if len(segment_polylines) > 1 else segment_polylines[0],

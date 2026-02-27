@@ -5,12 +5,11 @@ A local tool that converts a planar sketch image into one or more editable open 
 ## Versioning
 
 - Rule: every software update must bump the version and be logged in README.
-- Current version: `0.2.4` (2026-02-26)
+- Current version: `0.2.8` (2026-02-27)
 - Latest changes:
-  - Fixed packaged-app TLS fallback by shipping `cacert.pem` inside desktop assets.
-  - Update check keeps retry + fallback URL flow (`8s`, `2` attempts, `www` -> non-`www`).
-  - Update failure logs include concrete exception reason (DNS/SSL/timeout, etc).
-  - Windows packaging still follows GitHub Actions workflow `.github/workflows/build-windows-desktop.yml`.
+  - Update-check logs now distinguish clearly between `current version` and `feed latest` to avoid false “already latest 0.2.4” interpretation.
+  - Desktop macOS packager now enforces version bump before packaging (unless explicit override), and still auto-cleans old release artifacts.
+  - Repacked desktop deliverables for this release; Windows packaging flow remains the same GitHub Actions workflow.
 
 ## What it does
 Input:
@@ -192,6 +191,7 @@ Crossing-focused extraction controls:
 - `path_extract.cluster_radius_px`: groups nearby junction pixels into one stable node.
 - `path_extract.junction_bridge_max_px`: merges split junction clusters connected by a short bridge.
 - `path_extract.tangent_k`: tangent sampling distance used for direction pairing at junctions.
+- `path_extract.internal_path_min_length_px`: drops ultra-short internal edges created inside clustered junctions (useful for suppressing jagged clutter in `03_path_overlay`).
 
 Dense/junction-heavy drawings:
 
@@ -237,6 +237,7 @@ Recommended smoothing-first defaults (already reflected in `configs/default.yaml
 - `fit.segment.corner_scales_px: [6, 12, 24]` (multi-scale turning-angle detection)
 - `fit.segment.fillet_enable: true` (detect rounded corner transitions and split at tangency-like boundaries)
 - `fit.segment.endpoint_snap_tolerance_px: 2.5` (snap segment endpoints to same node for easy Join)
+- `fit.segment.min_length_px: 0.0` (set e.g. `2-4` to remove tiny short segment clutter after split)
 - `fit.spline.mode: "auto"` (`"smooth"` for always-spline, `"hard_edge"` for always-polyline-like)
 - `fit.spline.smoothing: 6.0`
 - `fit.spline.hard_edge_straight_max_deviation_px: 2.0`

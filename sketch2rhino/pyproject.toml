@@ -1,6 +1,6 @@
 [project]
 name = "sketch2rhino"
-version = "0.2.4"
+version = "0.2.8"
 description = "Convert planar sketch line image to one open NURBS curve in Rhino (.3dm)"
 readme = "README.md"
 requires-python = ">=3.11"

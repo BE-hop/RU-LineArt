@@ -36,6 +36,7 @@ class _SuperGraph:
     edges: list[_SuperEdge]
     incident: dict[int, list[int]]
     centers: dict[int, tuple[float, float]]
+    internal_paths: list[list[Pixel]]
 
 
 def _pixel_to_xy(pixel: Pixel) -> tuple[float, float]:
@@ -176,7 +177,7 @@ def _cut_loop_open(path: list[Pixel], loop_cut: str) -> list[Pixel]:
 
 def _build_super_graph(graph: StrokeGraph, cfg: PathExtractConfig) -> _SuperGraph:
     if not graph.node_points:
-        return _SuperGraph(edges=[], incident={}, centers={})
+        return _SuperGraph(edges=[], incident={}, centers={}, internal_paths=[])
 
     node_ids = sorted(graph.node_points.keys())
     deg = {nid: len(graph.adjacency.get(nid, set())) for nid in node_ids}
@@ -242,10 +243,17 @@ def _build_super_graph(graph: StrokeGraph, cfg: PathExtractConfig) -> _SuperGrap
     # Keep parallel edges between the same super-node pair: they may represent
     # distinct strokes crossing the same junction neighborhood.
     edges: list[_SuperEdge] = []
+    internal_paths: list[list[Pixel]] = []
+    internal_min_len = max(0.0, float(getattr(cfg, "internal_path_min_length_px", 0.0)))
     for edge in graph.edges:
         sa = key_to_super[root_key[edge.start]]
         sb = key_to_super[root_key[edge.end]]
         if sa == sb:
+            # Preserve internal edges instead of dropping them. In dense regions
+            # with aggressive junction clustering, these short links can encode
+            # visible strokes that should still be exported.
+            if len(edge.pixels) >= 2 and float(edge.length_px) >= internal_min_len:
+                internal_paths.append(list(edge.pixels))
             continue
 
         a, b = (sa, sb) if sa < sb else (sb, sa)
@@ -261,7 +269,7 @@ def _build_super_graph(graph: StrokeGraph, cfg: PathExtractConfig) -> _SuperGrap
         incident.setdefault(edge.a, []).append(eid)
         incident.setdefault(edge.b, []).append(eid)
 
-    return _SuperGraph(edges=edges, incident=incident, centers=centers)
+    return _SuperGraph(edges=edges, incident=incident, centers=centers, internal_paths=internal_paths)
 
 
 def _edge_pixels_from_node(edge: _SuperEdge, node: int) -> tuple[list[Pixel], int]:
@@ -456,7 +464,7 @@ def extract_open_paths(
 
     continuation = _build_continuation_map(super_graph, cfg)
     visited_edges: set[int] = set()
-    pixel_paths: list[list[Pixel]] = []
+    pixel_paths: list[list[Pixel]] = [list(path) for path in super_graph.internal_paths]
 
     endpoints = sorted([node for node, eids in super_graph.incident.items() if len(eids) == 1])
 

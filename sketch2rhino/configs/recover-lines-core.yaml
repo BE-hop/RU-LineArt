@@ -1,0 +1,8 @@
+output:
+  mode: "multi"
+  multi:
+    min_length_px: 6
+    max_curves: 0
+
+path_extract:
+  choose_component: "all"

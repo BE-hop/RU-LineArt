@@ -299,8 +299,10 @@ class UpdateCheckWorker(QThread):
                     if is_newer_version(info.latest, self.current_version):
                         self.status.emit(f"update_available:{info.latest}")
                         self.found.emit(info)
+                    elif is_newer_version(self.current_version, info.latest):
+                        self.status.emit(f"feed_older:{info.latest}:{self.current_version}")
                     else:
-                        self.status.emit(f"no_update:{info.latest}")
+                        self.status.emit(f"no_update:{info.latest}:{self.current_version}")
                     return
                 except (urllib.error.URLError, TimeoutError, OSError, ValueError) as exc:
                     # Network/JSON errors should not block app startup.
@@ -561,8 +563,26 @@ class MainWindow(QMainWindow):
             )
             return
         if status.startswith("no_update:"):
-            latest = status.split(":", 1)[1]
-            self._log(f"{bi('已检查更新，当前已是最新版本', 'Checked update, already latest')}: {latest}")
+            payload = status.split(":", 1)[1]
+            if ":" in payload:
+                latest, current = payload.split(":", 1)
+            else:
+                latest, current = payload, self.current_version
+            self._log(
+                f"{bi('已检查更新，当前已是最新版本', 'Checked update, already latest')}: "
+                f"{current} ({bi('更新源版本', 'feed latest')}: {latest})"
+            )
+            return
+        if status.startswith("feed_older:"):
+            payload = status.split(":", 1)[1]
+            if ":" in payload:
+                latest, current = payload.split(":", 1)
+            else:
+                latest, current = payload, self.current_version
+            self._log(
+                f"{bi('更新源版本低于当前版本，保持当前版本', 'Feed version is older than current; keeping current')}: "
+                f"{current} ({bi('更新源版本', 'feed latest')}: {latest})"
+            )
             return
         if status.startswith("update_available:"):
             latest = status.split(":", 1)[1]

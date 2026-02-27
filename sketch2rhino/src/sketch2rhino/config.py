@@ -45,6 +45,7 @@ class PathExtractConfig(BaseModel):
     cluster_radius_px: float = 4.0
     junction_bridge_max_px: float = 12.0
     tangent_k: int = 10
+    internal_path_min_length_px: float = 0.0
 
 
 class SimplifyConfig(BaseModel):
@@ -114,6 +115,7 @@ class SegmentConfig(BaseModel):
     straight_max_deviation_ratio: float = 0.02
     straight_max_turn_deg: float = 12.0
     min_segment_points: int = 3
+    min_length_px: float = 0.0
     forced_break_tolerance_px: float = 3.0
     endpoint_snap_tolerance_px: float = 2.5
 

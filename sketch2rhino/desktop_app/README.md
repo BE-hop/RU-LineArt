@@ -19,7 +19,7 @@ This folder contains a local desktop wrapper for `sketch2rhino`.
 ## Versioning
 
 - Rule: each software update must bump version and update README notes.
-- Current version: `0.2.4` (2026-02-26)
+- Current version: `0.2.8` (2026-02-27)
 
 ## Run locally (development)
 
@@ -40,6 +40,12 @@ chmod +x desktop_app/build_macos.sh
 Expected output:
 
 `/Users/mac/Documents/RU-LineArt/sketch2rhino/desktop_app/dist/RU-LineArt.app`
+
+Build behavior (auto cleanup):
+
+- Deletes old macOS release folders/zips (`RU-LineArt-v*-macOS*`) before packaging.
+- Deletes stale build cache (`build/`, `dist/`, `.spec`, `.DS_Store`) before each build.
+- Keeps only current version package + `RU-LineArt-macOS.zip`.
 
 The macOS dist folder also includes:
 
@@ -136,7 +142,7 @@ JSON format:
 
 ```json
 {
-  "latest": "0.2.4",
+  "latest": "0.2.8",
   "force": false,
   "page": "https://www.behop.cn/behop-ai-product/products/ru-lineart/",
   "notes": "Bug fixes and quality improvements."

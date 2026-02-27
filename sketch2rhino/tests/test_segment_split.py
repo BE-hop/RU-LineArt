@@ -3,7 +3,7 @@ import pytest
 
 from sketch2rhino.config import SegmentConfig
 from sketch2rhino.fit.nurbs_fit import should_use_polyline_geometry
-from sketch2rhino.fit.segment_split import snap_segment_endpoints, split_polyline_into_segments
+from sketch2rhino.fit.segment_split import _window_is_straight, snap_segment_endpoints, split_polyline_into_segments
 from sketch2rhino.types import Polyline2D
 from sketch2rhino.config import FitConfig
 
@@ -66,3 +66,19 @@ def test_snap_segment_endpoints_unifies_join_nodes():
     start2 = snapped[1].points[0]
     assert end1 == pytest.approx(start2, abs=1e-8)
     assert node_pairs[0][1] == node_pairs[1][0]
+
+
+def test_window_straight_is_robust_to_single_outlier_point():
+    xs = np.linspace(0.0, 120.0, 41)
+    ys = np.zeros_like(xs)
+    ys[len(ys) // 2] = 3.0
+    points = np.column_stack([xs, ys]).astype(np.float64)
+
+    cfg = SegmentConfig(
+        straight_min_chord_px=8.0,
+        straight_max_deviation_px=2.0,
+        straight_max_deviation_ratio=0.0,
+        straight_max_turn_deg=180.0,  # isolate deviation metric in this regression test
+    )
+
+    assert _window_is_straight(points, cfg) is True

@@ -1,0 +1,52 @@
+preprocess:
+  target_black_on_white: true
+  denoise:
+    enable: false
+    method: "gaussian"
+    strength: 1.0
+  binarize:
+    method: "otsu"
+    block_size: 31
+    C: 7
+    otsu_offset: -8.0
+  morph:
+    erode_iter: 1
+    close_iter: 0
+    open_iter: 0
+
+skeleton:
+  prune_spurs: false
+
+path_extract:
+  choose_component: "all"
+  crossing_policy: "overpass"
+  cluster_radius_px: 2.5
+  junction_bridge_max_px: 6.0
+  tangent_k: 10
+  internal_path_min_length_px: 1.1
+
+fit:
+  geometry_mode: "mixed"
+  segment:
+    min_length_px: 3.0
+  stabilize:
+    enable: true
+    method: "savgol"
+    window: 9
+    polyorder: 2
+    passes: 2
+    blend: 0.55
+    resample_step_px: 1.0
+    anchor_snap_radius_px: 3.0
+  simplify:
+    method: "rdp"
+    epsilon_px: 0.8
+    smooth_enable: false
+    smooth_window: 7
+    smooth_passes: 1
+
+output:
+  mode: "multi"
+  multi:
+    min_length_px: 1
+    max_curves: 0

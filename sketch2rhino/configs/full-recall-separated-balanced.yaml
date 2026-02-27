@@ -1,0 +1,39 @@
+path_extract:
+  choose_component: "all"
+  crossing_policy: "overpass"
+  cluster_radius_px: 2.5
+  junction_bridge_max_px: 6.0
+  tangent_k: 10
+  internal_path_min_length_px: 1.1
+
+skeleton:
+  prune_spurs: false
+
+preprocess:
+  morph:
+    close_iter: 0
+    erode_iter: 0
+    open_iter: 0
+
+fit:
+  geometry_mode: "mixed"
+  segment:
+    min_length_px: 3.0
+  stabilize:
+    enable: true
+    method: "savgol"
+    window: 9
+    polyorder: 2
+    passes: 2
+    blend: 0.5
+    resample_step_px: 1.0
+    anchor_snap_radius_px: 3.0
+  simplify:
+    method: "rdp"
+    epsilon_px: 0.8
+
+output:
+  mode: "multi"
+  multi:
+    min_length_px: 1
+    max_curves: 0

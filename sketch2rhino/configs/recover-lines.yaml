@@ -1,0 +1,112 @@
+preprocess:
+  target_black_on_white: true
+  denoise:
+    enable: false
+    method: "gaussian"
+    strength: 1.0
+  binarize:
+    method: "otsu"
+    block_size: 31
+    C: 7
+    otsu_offset: 0
+  morph:
+    erode_iter: 0
+    close_iter: 1
+    open_iter: 0
+
+skeleton:
+  prune_spurs: false
+  spur_min_length_px: 8
+
+path_extract:
+  mode: "main_open_path"
+  crossing_policy: "overpass"
+  choose_component: "all"
+  loop_cut: "min_curvature"
+  cluster_radius_px: 4.0
+  junction_bridge_max_px: 12.0
+  tangent_k: 10
+
+fit:
+  geometry_mode: "mixed"
+  degree: 3
+  max_control_points: 50
+  segment:
+    enable: true
+    window_points: 9
+    corner_split_angle_deg: 45.0
+    corner_resample_step_px: 2.0
+    corner_scales_px: [6.0, 12.0, 24.0]
+    corner_multiscale_ratio: 0.65
+    corner_min_scales_hit: 2
+    corner_region_gap_points: 1
+    fillet_enable: true
+    fillet_line_window_points: 6
+    fillet_line_residual_px: 1.0
+    fillet_circle_residual_px: 1.5
+    fillet_min_turn_deg: 35.0
+    fillet_max_turn_deg: 170.0
+    fillet_radius_min_px: 2.0
+    fillet_radius_max_px: 2000.0
+    fillet_max_span_px: 80.0
+    break_merge_distance_px: 2.0
+    straight_min_chord_px: 12.0
+    straight_max_deviation_px: 2.0
+    straight_max_deviation_ratio: 0.02
+    straight_max_turn_deg: 12.0
+    min_segment_points: 3
+    forced_break_tolerance_px: 3.0
+    endpoint_snap_tolerance_px: 2.5
+  stabilize:
+    enable: false
+    method: "savgol"
+    window: 11
+    polyorder: 2
+    passes: 2
+    blend: 0.7
+    resample_step_px: 1.0
+    anchor_snap_radius_px: 4.0
+  simplify:
+    method: "rdp"
+    epsilon_px: 0.6
+    smooth_enable: false
+    smooth_window: 7
+    smooth_passes: 1
+  spline:
+    mode: "auto"
+    smoothing: 6.0
+    max_iter: 6
+    fallback_if_fail: true
+    anchor_correction_enable: true
+    anchor_tolerance_px: 2.0
+    anchor_snap_max_dist_px: 10.0
+    anchor_weight: 20.0
+    anchor_neighbor_weight: 6.0
+    anchor_refit_max_iter: 2
+    anchor_sample_count: 400
+    hard_edge_corner_angle_deg: 45.0
+    hard_edge_right_angle_tolerance_deg: 30.0
+    hard_edge_min_corners: 3
+    hard_edge_max_vertices: 20
+    hard_edge_corner_ratio_min: 0.35
+    hard_edge_right_angle_ratio_min: 0.4
+    hard_edge_straight_min_length_px: 20.0
+    hard_edge_straight_max_deviation_px: 2.0
+    hard_edge_straight_max_deviation_ratio: 0.02
+    hard_edge_straight_max_turn_deg: 12.0
+
+export:
+  plane: "XY"
+  layer_name: "sketch_curve"
+  object_name: "main_nurbs"
+  multi_object_prefix: "stroke"
+
+output:
+  mode: "multi"
+  multi:
+    min_length_px: 6
+    max_curves: 0
+    include_loops: true
+    sort_by: "length"
+    preserve_junctions: true
+    junction_snap_radius_px: 3.0

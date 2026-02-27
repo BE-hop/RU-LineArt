@@ -5,7 +5,13 @@ pytest.importorskip("scipy")
 
 from sketch2rhino.config import PathExtractConfig
 from sketch2rhino.topo.graph_build import build_stroke_graph
-from sketch2rhino.topo.path_extract import choose_main_component, extract_main_open_path, extract_open_paths
+from sketch2rhino.topo.path_extract import (
+    _build_super_graph,
+    choose_main_component,
+    extract_main_open_path,
+    extract_open_paths,
+)
+from sketch2rhino.types import GraphEdge, StrokeGraph
 
 
 def test_graph_and_path_extract_on_open_stroke():
@@ -101,3 +107,113 @@ def test_extract_open_paths_returns_multiple_strokes():
     assert len(paths) >= 2
     for poly in paths:
         assert len(poly.points) >= 2
+
+
+def test_extract_open_paths_preserves_internal_cluster_edges():
+    # Two nearby junction nodes become one super-node under default cluster
+    # radius, but the short visible link between them should still be kept.
+    node_points = {
+        0: (10, 10),
+        1: (10, 13),
+        2: (8, 10),
+        3: (12, 10),
+        4: (8, 13),
+        5: (12, 13),
+    }
+    adjacency = {
+        0: {1, 2, 3},
+        1: {0, 4, 5},
+        2: {0},
+        3: {0},
+        4: {1},
+        5: {1},
+    }
+    edges = [
+        GraphEdge(start=0, end=1, pixels=[(10, 10), (10, 11), (10, 12), (10, 13)], length_px=3.0),
+        GraphEdge(start=0, end=2, pixels=[(10, 10), (9, 10), (8, 10)], length_px=2.0),
+        GraphEdge(start=0, end=3, pixels=[(10, 10), (11, 10), (12, 10)], length_px=2.0),
+        GraphEdge(start=1, end=4, pixels=[(10, 13), (9, 13), (8, 13)], length_px=2.0),
+        GraphEdge(start=1, end=5, pixels=[(10, 13), (11, 13), (12, 13)], length_px=2.0),
+    ]
+    graph = StrokeGraph(
+        node_points=node_points,
+        adjacency=adjacency,
+        edges=edges,
+        endpoints={2, 3, 4, 5},
+        component_size_px=0,
+    )
+
+    skeleton = np.zeros((25, 25), dtype=np.uint8)
+    for e in edges:
+        for r, c in e.pixels:
+            skeleton[r, c] = 1
+
+    cfg = PathExtractConfig(cluster_radius_px=4.0, junction_bridge_max_px=12.0, crossing_policy="overpass")
+    super_graph = _build_super_graph(graph, cfg)
+    assert len(super_graph.internal_paths) >= 1
+
+    paths = extract_open_paths(
+        skeleton=skeleton,
+        graph=graph,
+        cfg=cfg,
+        min_length_px=0.0,
+        max_curves=None,
+        include_loops=True,
+    )
+
+    found_internal = False
+    for pl in paths:
+        arr = np.asarray(pl.points, dtype=float)
+        if len(arr) < 4:
+            continue
+        if not np.allclose(arr[:, 1], -10.0):
+            continue
+        x0 = float(arr[0, 0])
+        x1 = float(arr[-1, 0])
+        if {round(x0, 6), round(x1, 6)} == {10.0, 13.0}:
+            found_internal = True
+            break
+
+    assert found_internal is True
+
+
+def test_super_graph_filters_short_internal_cluster_edges():
+    node_points = {
+        0: (10, 10),
+        1: (10, 11),
+        2: (8, 10),
+        3: (12, 10),
+        4: (8, 11),
+        5: (12, 11),
+    }
+    adjacency = {
+        0: {1, 2, 3},
+        1: {0, 4, 5},
+        2: {0},
+        3: {0},
+        4: {1},
+        5: {1},
+    }
+    edges = [
+        GraphEdge(start=0, end=1, pixels=[(10, 10), (10, 11)], length_px=1.0),
+        GraphEdge(start=0, end=2, pixels=[(10, 10), (9, 10), (8, 10)], length_px=2.0),
+        GraphEdge(start=0, end=3, pixels=[(10, 10), (11, 10), (12, 10)], length_px=2.0),
+        GraphEdge(start=1, end=4, pixels=[(10, 11), (9, 11), (8, 11)], length_px=2.0),
+        GraphEdge(start=1, end=5, pixels=[(10, 11), (11, 11), (12, 11)], length_px=2.0),
+    ]
+    graph = StrokeGraph(
+        node_points=node_points,
+        adjacency=adjacency,
+        edges=edges,
+        endpoints={2, 3, 4, 5},
+        component_size_px=0,
+    )
+
+    cfg = PathExtractConfig(
+        cluster_radius_px=4.0,
+        junction_bridge_max_px=12.0,
+        crossing_policy="overpass",
+        internal_path_min_length_px=2.0,
+    )
+    super_graph = _build_super_graph(graph, cfg)
+    assert super_graph.internal_paths == []

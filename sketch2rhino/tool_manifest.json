@@ -4,7 +4,7 @@
   "provider": "BEhop",
   "author": "BEhop Design AI Lab",
   "url": "https://behop.cn",
-  "version": "0.1.0",
+  "version": "0.2.8",
   "endpoint": "http://127.0.0.1:8000",
   "openapi": "http://127.0.0.1:8000/openapi.json",
   "health": "http://127.0.0.1:8000/health",

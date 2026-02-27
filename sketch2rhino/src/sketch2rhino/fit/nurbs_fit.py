@@ -160,17 +160,28 @@ def _is_near_straight(points: np.ndarray, cfg: FitConfig) -> bool:
         else:
             return False
 
-    max_dev = 0.0
+    dev95 = 0.0
     if len(points) > 2:
-        max_dev = max(_point_line_distance(p, start, end) for p in points[1:-1])
+        dev = np.asarray([_point_line_distance(p, start, end) for p in points[1:-1]], dtype=np.float64)
+        if len(dev) > 0:
+            dev95 = float(np.percentile(dev, 95.0))
     dev_limit = max(
         float(cfg.spline.hard_edge_straight_max_deviation_px),
         float(cfg.spline.hard_edge_straight_max_deviation_ratio) * chord,
     )
     if short_candidate:
         dev_limit = min(dev_limit, 0.8)
-    if max_dev > dev_limit:
+    if dev95 > dev_limit:
         return False
+
+    if short_candidate:
+        # Raster stair-stepping often creates large local turn angles on short
+        # straight strokes; for these short candidates, trust line deviation.
+        return True
+    if len(points) <= 4 and dev95 <= 0.8:
+        # Very short edge fragments (e.g. tiny rectangle sides) are sensitive
+        # to quantized turning noise; classify by deviation-only.
+        return True
 
     seg = np.diff(points, axis=0)
     seg_len = np.linalg.norm(seg, axis=1)

@@ -54,6 +54,19 @@ def test_auto_mode_detects_near_straight_as_polyline():
     assert len(reduced.points) <= 30
 
 
+def test_auto_mode_near_straight_ignores_single_outlier():
+    xs = np.linspace(0.0, 120.0, 80)
+    ys = 0.4 * np.sin(xs * 0.04)
+    ys[len(ys) // 2] += 3.0
+    poly = Polyline2D(points=[(float(x), float(y)) for x, y in zip(xs, ys, strict=True)])
+
+    cfg = FitConfig(max_control_points=30)
+    cfg.spline.mode = "auto"
+    cfg.spline.hard_edge_straight_max_turn_deg = 20.0
+
+    assert should_use_polyline_geometry(poly, cfg) is True
+
+
 def test_fit_open_polyline_collapses_near_straight_to_two_points():
     xs = np.linspace(0.0, 60.0, 40)
     ys = 0.4 * np.sin(xs * 0.07)
@@ -81,6 +94,31 @@ def test_short_straight_prefers_polyline_but_not_forced_two_points():
     assert should_use_polyline_geometry(poly, cfg) is True
     reduced = fit_open_polyline(poly, cfg)
     assert len(reduced.points) >= 3
+
+
+def test_short_staircase_straight_prefers_polyline():
+    # Pixel stair-stepping on short straight edges should not force NURBS.
+    points = [(0.0, 0.0), (1.0, -1.0), (2.0, -1.0), (3.0, -2.0), (4.0, -2.0)]
+    poly = Polyline2D(points=points)
+
+    cfg = FitConfig(max_control_points=50)
+    cfg.spline.mode = "auto"
+    cfg.spline.hard_edge_straight_min_length_px = 20.0
+    cfg.segment.straight_min_chord_px = 12.0
+
+    assert should_use_polyline_geometry(poly, cfg) is True
+
+
+def test_four_point_quantized_edge_prefers_polyline():
+    points = [(0.0, 0.0), (6.0, -0.8), (12.0, 0.4), (18.0, 0.0)]
+    poly = Polyline2D(points=points)
+
+    cfg = FitConfig(max_control_points=50)
+    cfg.spline.mode = "auto"
+    cfg.spline.hard_edge_straight_min_length_px = 20.0
+    cfg.segment.straight_min_chord_px = 12.0
+
+    assert should_use_polyline_geometry(poly, cfg) is True
 
 
 def test_auto_mode_keeps_curvy_shape_as_nurbs():
