@@ -25,6 +25,7 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QMainWindow,
     QMessageBox,
+    QProgressBar,
     QPushButton,
     QPlainTextEdit,
     QVBoxLayout,
@@ -80,6 +81,24 @@ GEOMETRY_MODE_CHOICES: list[tuple[str, str]] = [
 ]
 GEOMETRY_MODE_LABELS: dict[str, str] = dict(GEOMETRY_MODE_CHOICES)
 VALID_GEOMETRY_MODES = set(GEOMETRY_MODE_LABELS.keys())
+PROGRESS_STAGE_LABELS: dict[str, str] = {
+    "start": bi("准备中", "Preparing"),
+    "load_image": bi("读取图片", "Loading image"),
+    "preprocess": bi("图像预处理", "Preprocessing"),
+    "skeletonize": bi("骨架提取", "Skeletonizing"),
+    "split_components": bi("分离连通域", "Splitting components"),
+    "build_graphs": bi("构建拓扑图", "Building graphs"),
+    "extract_paths": bi("提取路径", "Extracting paths"),
+    "preserve_junctions": bi("保护节点", "Preserving junctions"),
+    "split_and_simplify": bi("分段与简化", "Splitting and simplifying"),
+    "endpoint_snap": bi("端点吸附", "Snapping endpoints"),
+    "join_segments": bi("链式合并", "Joining segments"),
+    "post_join_smooth": bi("合并后平滑", "Post-join smoothing"),
+    "filter_segments": bi("过滤无效段", "Filtering segments"),
+    "fit_geometry": bi("拟合几何", "Fitting geometry"),
+    "export_3dm": bi("写入 3dm", "Exporting 3dm"),
+    "done": bi("完成", "Done"),
+}
 
 
 @dataclass(frozen=True)
@@ -244,6 +263,7 @@ def default_icon_path() -> Path | None:
 class ConvertWorker(QThread):
     done = Signal(str)
     failed = Signal(str)
+    progress = Signal(int, str)
 
     def __init__(
         self,
@@ -267,11 +287,17 @@ class ConvertWorker(QThread):
                     "Expected one of: mixed, polyline_only, nurbs_only."
                 )
             cfg.fit.geometry_mode = self.geometry_mode
+
+            def _progress_cb(value: float, stage: str) -> None:
+                pct = int(max(0, min(100, round(float(value) * 100.0))))
+                self.progress.emit(pct, str(stage or ""))
+
             result = run_pipeline(
                 image_path=self.image_path,
                 output_path=self.output_path,
                 cfg=cfg,
                 debug_dir=None,
+                progress_cb=_progress_cb,
             )
             self.done.emit(str(result.output_path))
         except Exception:
@@ -331,6 +357,7 @@ class MainWindow(QMainWindow):
         self.worker: ConvertWorker | None = None
         self.update_worker: UpdateCheckWorker | None = None
         self.current_version = __version__
+        self._last_progress_stage = ""
         self._build_ui()
 
     def _build_ui(self) -> None:
@@ -413,6 +440,16 @@ class MainWindow(QMainWindow):
         actions.addStretch(1)
         layout.addLayout(actions)
 
+        progress_row = QHBoxLayout()
+        self.progress_label = QLabel(f"{bi('进度', 'Progress')}: 0%")
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setValue(0)
+        self.progress_bar.setTextVisible(True)
+        progress_row.addWidget(self.progress_label)
+        progress_row.addWidget(self.progress_bar, 1)
+        layout.addLayout(progress_row)
+
         self.log_edit = QPlainTextEdit()
         self.log_edit.setReadOnly(True)
         self.log_edit.setPlaceholderText(bi("运行日志", "Logs"))
@@ -462,6 +499,21 @@ class MainWindow(QMainWindow):
             self.output_edit.setText(str(image_path.with_suffix(".3dm")))
         self._log(f"{bi('已选择图片', 'Image selected')}: {image_path}")
 
+    def _set_progress(self, percent: int, stage: str) -> None:
+        pct = max(0, min(100, int(percent)))
+        stage_key = str(stage).strip()
+        stage_label = PROGRESS_STAGE_LABELS.get(stage_key, stage_key or bi("处理中", "Processing"))
+        self.progress_bar.setValue(pct)
+        self.progress_label.setText(f"{bi('进度', 'Progress')}: {pct}% | {stage_label}")
+
+    def _on_progress(self, percent: int, stage: str) -> None:
+        self._set_progress(percent, stage)
+        stage_key = str(stage).strip()
+        if stage_key and stage_key != self._last_progress_stage:
+            stage_label = PROGRESS_STAGE_LABELS.get(stage_key, stage_key)
+            self._log(f"{bi('进度', 'Progress')}: {percent}% | {stage_label}")
+            self._last_progress_stage = stage_key
+
     def _generate(self) -> None:
         image_text = self.image_edit.text().strip()
         output_text = self.output_edit.text().strip()
@@ -502,6 +554,8 @@ class MainWindow(QMainWindow):
             return
 
         self.generate_btn.setEnabled(False)
+        self._last_progress_stage = ""
+        self._set_progress(0, "start")
         self._log(
             f"{bi('正在转换...', 'Converting...')} "
             f"{bi('模式', 'Mode')}: {GEOMETRY_MODE_LABELS.get(geometry_mode, geometry_mode)}"
@@ -515,10 +569,12 @@ class MainWindow(QMainWindow):
         )
         self.worker.done.connect(self._on_done)
         self.worker.failed.connect(self._on_failed)
+        self.worker.progress.connect(self._on_progress)
         self.worker.finished.connect(lambda: self.generate_btn.setEnabled(True))
         self.worker.start()
 
     def _on_done(self, output_path: str) -> None:
+        self._set_progress(100, "done")
         self._log(f"{bi('完成', 'Done')}: {output_path}")
         QMessageBox.information(
             self,
@@ -527,6 +583,7 @@ class MainWindow(QMainWindow):
         )
 
     def _on_failed(self, error_text: str) -> None:
+        self._set_progress(self.progress_bar.value(), bi("失败", "Failed"))
         self._log(f"{bi('转换失败', 'Failed')}:\n{error_text}")
         QMessageBox.critical(
             self,

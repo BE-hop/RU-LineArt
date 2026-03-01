@@ -3,7 +3,12 @@ import pytest
 
 from sketch2rhino.config import SegmentConfig
 from sketch2rhino.fit.nurbs_fit import should_use_polyline_geometry
-from sketch2rhino.fit.segment_split import _window_is_straight, snap_segment_endpoints, split_polyline_into_segments
+from sketch2rhino.fit.segment_split import (
+    _window_is_straight,
+    join_collinear_segments,
+    snap_segment_endpoints,
+    split_polyline_into_segments,
+)
 from sketch2rhino.types import Polyline2D
 from sketch2rhino.config import FitConfig
 
@@ -66,6 +71,55 @@ def test_snap_segment_endpoints_unifies_join_nodes():
     start2 = snapped[1].points[0]
     assert end1 == pytest.approx(start2, abs=1e-8)
     assert node_pairs[0][1] == node_pairs[1][0]
+
+
+def test_snap_segment_endpoints_keeps_transitive_cluster_connectivity():
+    seg1 = Polyline2D(points=[(-10.0, 0.0), (0.0, 0.0)])
+    seg2 = Polyline2D(points=[(0.8, 0.0), (12.0, 0.0)])
+    seg3 = Polyline2D(points=[(1.6, 0.0), (14.0, 0.0)])
+
+    snapped, node_pairs, _ = snap_segment_endpoints([seg1, seg2, seg3], tolerance_px=1.0)
+
+    e1 = snapped[0].points[-1]
+    s2 = snapped[1].points[0]
+    s3 = snapped[2].points[0]
+    assert e1 == pytest.approx(s2, abs=1e-8)
+    assert e1 == pytest.approx(s3, abs=1e-8)
+    assert node_pairs[0][1] == node_pairs[1][0] == node_pairs[2][0]
+
+
+def test_join_collinear_segments_merges_degree2_chain():
+    segments = [
+        Polyline2D(points=[(0.0, 0.0), (5.0, 0.0)]),
+        Polyline2D(points=[(5.0, 0.0), (10.0, 0.0)]),
+        Polyline2D(points=[(10.0, 0.0), (15.0, 0.0)]),
+    ]
+    node_pairs = [(0, 1), (1, 2), (2, 3)]
+
+    merged, merged_pairs, groups = join_collinear_segments(segments, node_pairs, angle_tolerance_deg=8.0)
+
+    assert len(merged) == 1
+    assert len(groups) == 1
+    assert groups[0] == [0, 1, 2]
+    assert merged_pairs[0] == (0, 3)
+    assert merged[0].points[0] == pytest.approx((0.0, 0.0), abs=1e-8)
+    assert merged[0].points[-1] == pytest.approx((15.0, 0.0), abs=1e-8)
+
+
+def test_join_collinear_segments_keeps_junction_unmerged():
+    segments = [
+        Polyline2D(points=[(0.0, 0.0), (5.0, 0.0)]),
+        Polyline2D(points=[(5.0, 0.0), (10.0, 0.0)]),
+        Polyline2D(points=[(5.0, 0.0), (5.0, 4.0)]),
+    ]
+    node_pairs = [(0, 1), (1, 2), (1, 3)]
+
+    merged, merged_pairs, groups = join_collinear_segments(segments, node_pairs, angle_tolerance_deg=8.0)
+
+    assert len(merged) == 3
+    assert len(groups) == 3
+    assert sorted(len(g) for g in groups) == [1, 1, 1]
+    assert sorted(merged_pairs) == sorted(node_pairs)
 
 
 def test_window_straight_is_robust_to_single_outlier_point():

@@ -93,6 +93,8 @@ class SplineConfig(BaseModel):
 
 class SegmentConfig(BaseModel):
     enable: bool = True
+    pre_simplify_enable: bool = True
+    pre_simplify_epsilon_px: float = 0.65
     window_points: int = 9
     corner_split_angle_deg: float = 45.0
     corner_resample_step_px: float = 2.0
@@ -118,6 +120,11 @@ class SegmentConfig(BaseModel):
     min_length_px: float = 0.0
     forced_break_tolerance_px: float = 3.0
     endpoint_snap_tolerance_px: float = 2.5
+    join_enable: bool = True
+    join_angle_tolerance_deg: float = 8.0
+    post_join_smooth_enable: bool = True
+    post_join_smooth_window: int = 5
+    post_join_smooth_passes: int = 1
 
 
 class FitConfig(BaseModel):

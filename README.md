@@ -13,12 +13,13 @@
 ## 版本管理
 
 - 规则：每次软件更新都要递增版本号，并在 README 记录。
-- 当前版本：`0.2.4`（2026-02-26）
+- 规则：凡是会影响下次阅读/操作判断的行为改动，必须同步更新 README。
+- 当前版本：`0.2.11`（2026-02-28）
 - 本次更新：
-  - 修复打包后更新检查证书回退失效问题（`cacert.pem` 随安装包一起分发）。
-  - 更新检查保持重试机制（每个地址重试 2 次）与备用网址回退（`www` -> 非 `www`）。
-  - 更新失败日志继续显示具体异常原因（例如 DNS/SSL/超时）。
-  - Windows 版继续沿用原 GitHub Actions 工作流：`.github/workflows/build-windows-desktop.yml`。
+  - `polyline_only` 继续保持“不过滤路径”，直线模式不做 `max_curves` 截断，避免丢线。
+  - `nurbs_only` 改为“保留优先”路径策略（放宽最短长度、不再按 `max_curves` 截断），并增加中值+闭运算清理，曲线更连续。
+  - `mixed` 改为“保留优先”路径策略（放宽最短长度、无 `max_curves` 截断），并在 skeleton 前加轻量闭运算，减少锯齿和断裂。
+  - `report.json` 新增 `alignment_px` 指标，用于自动评估 3dm 曲线与骨架线的像素偏差（便于后续自动调参）。
 
 ## 快速开始
 
@@ -56,6 +57,21 @@ cd /Users/mac/Documents/RU-LineArt/sketch2rhino
 
 # 全量测试
 .venv/bin/python -m pytest -q
+```
+
+## 模式基准测试图
+
+后续每次模式测试固定使用这 3 张图，避免同图混用导致判断偏差：
+
+- `polyline_only` -> `data/samples/直线测试图.jpg`
+- `nurbs_only` -> `data/samples/曲线测试图.jpg`
+- `mixed` -> `data/samples/混合测试图.jpg`
+
+一键运行三模式基准测试：
+
+```bash
+cd /Users/mac/Documents/RU-LineArt/sketch2rhino
+./scripts/run_mode_baseline_images.sh
 ```
 
 ## 详细文档

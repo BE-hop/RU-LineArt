@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import cv2
 import numpy as np
 
 from sketch2rhino.config import SimplifyConfig
@@ -17,24 +18,17 @@ def _point_line_distance(point: np.ndarray, start: np.ndarray, end: np.ndarray) 
 def _rdp(points: np.ndarray, epsilon: float) -> np.ndarray:
     if len(points) < 3:
         return points
+    eps = max(0.0, float(epsilon))
+    approx = cv2.approxPolyDP(points.astype(np.float32).reshape(-1, 1, 2), epsilon=eps, closed=False)
+    if approx is None or len(approx) == 0:
+        return np.vstack([points[0], points[-1]])
 
-    start = points[0]
-    end = points[-1]
-
-    max_dist = -1.0
-    idx = -1
-    for i in range(1, len(points) - 1):
-        d = _point_line_distance(points[i], start, end)
-        if d > max_dist:
-            max_dist = d
-            idx = i
-
-    if max_dist <= epsilon:
-        return np.vstack([start, end])
-
-    left = _rdp(points[: idx + 1], epsilon)
-    right = _rdp(points[idx:], epsilon)
-    return np.vstack([left[:-1], right])
+    out = approx.reshape(-1, 2).astype(np.float64)
+    if len(out) < 2:
+        return np.vstack([points[0], points[-1]])
+    out[0] = points[0]
+    out[-1] = points[-1]
+    return out
 
 
 def _protected_indices(

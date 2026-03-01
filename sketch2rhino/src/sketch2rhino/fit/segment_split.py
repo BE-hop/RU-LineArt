@@ -548,10 +548,32 @@ def snap_segment_endpoints(
     tol = max(0.0, float(tolerance_px))
     dsu = _Dsu(len(endpoints))
     if tol > 0.0:
-        for i in range(len(endpoints)):
-            for j in range(i + 1, len(endpoints)):
-                if float(np.linalg.norm(endpoints[i] - endpoints[j])) <= tol:
-                    dsu.union(i, j)
+        # Build a uniform spatial grid so each endpoint checks only local neighbors.
+        # This avoids O(n^2) all-pairs scans when the segment count is large.
+        endpoint_arr = np.asarray(endpoints, dtype=np.float64)
+        tol_sq = float(tol * tol)
+        cell_size = float(tol)
+        grid: dict[tuple[int, int], list[int]] = {}
+
+        for i in range(len(endpoint_arr)):
+            x = float(endpoint_arr[i, 0])
+            y = float(endpoint_arr[i, 1])
+            cx = int(math.floor(x / cell_size))
+            cy = int(math.floor(y / cell_size))
+
+            for gx in (cx - 1, cx, cx + 1):
+                for gy in (cy - 1, cy, cy + 1):
+                    for j in grid.get((gx, gy), []):
+                        dx = x - float(endpoint_arr[j, 0])
+                        dy = y - float(endpoint_arr[j, 1])
+                        if (dx * dx + dy * dy) <= tol_sq:
+                            dsu.union(i, j)
+
+            key = (cx, cy)
+            if key in grid:
+                grid[key].append(i)
+            else:
+                grid[key] = [i]
 
     groups: dict[int, list[int]] = {}
     for i in range(len(endpoints)):
@@ -589,3 +611,139 @@ def snap_segment_endpoints(
         node_pairs.append((start_node, end_node))
 
     return snapped_segments, node_pairs, node_centers
+
+
+def _endpoint_outward_tangent(points: np.ndarray, side: int) -> np.ndarray | None:
+    if len(points) < 2:
+        return None
+    if side == 0:
+        vec = points[1] - points[0]
+    else:
+        vec = points[-2] - points[-1]
+    norm = float(np.linalg.norm(vec))
+    if norm <= 1e-9:
+        return None
+    return (vec / norm).astype(np.float64)
+
+
+def join_collinear_segments(
+    segments: list[Polyline2D],
+    node_pairs: list[tuple[int, int]],
+    angle_tolerance_deg: float,
+) -> tuple[list[Polyline2D], list[tuple[int, int]], list[list[int]]]:
+    """Join degree-2 chain segments that are nearly collinear at shared nodes."""
+    if not segments:
+        return [], [], []
+    if len(segments) != len(node_pairs):
+        raise ValueError("segments and node_pairs must have the same length")
+
+    arrays = [seg.as_array() for seg in segments]
+    incidents: dict[int, list[tuple[int, int]]] = {}
+    for i, (start_node, end_node) in enumerate(node_pairs):
+        if start_node >= 0:
+            incidents.setdefault(int(start_node), []).append((i, 0))
+        if end_node >= 0:
+            incidents.setdefault(int(end_node), []).append((i, 1))
+
+    angle_tol = max(0.0, min(179.9, float(angle_tolerance_deg)))
+    cos_limit = float(math.cos(math.radians(angle_tol)))
+    transition: dict[tuple[int, int], tuple[int, int]] = {}
+
+    for node_inc in incidents.values():
+        if len(node_inc) != 2:
+            continue
+        (seg_a, side_a), (seg_b, side_b) = node_inc
+        ta = _endpoint_outward_tangent(arrays[seg_a], side_a)
+        tb = _endpoint_outward_tangent(arrays[seg_b], side_b)
+        if ta is None or tb is None:
+            continue
+        dot = float(np.dot(ta, tb))
+        if dot <= -cos_limit:
+            transition[(seg_a, side_a)] = (seg_b, side_b)
+            transition[(seg_b, side_b)] = (seg_a, side_a)
+
+    def _node_of_endpoint(seg_idx: int, side: int) -> int:
+        pair = node_pairs[seg_idx]
+        return int(pair[0] if side == 0 else pair[1])
+
+    used = [False] * len(segments)
+    merged_segments: list[Polyline2D] = []
+    merged_pairs: list[tuple[int, int]] = []
+    merged_groups: list[list[int]] = []
+
+    def _walk_chain(seed_seg: int, seed_side: int) -> None:
+        if used[seed_seg]:
+            return
+
+        current_seg = int(seed_seg)
+        enter_side = int(seed_side)
+        start_node = _node_of_endpoint(current_seg, enter_side)
+        points_acc: list[tuple[float, float]] = []
+        group: list[int] = []
+        last_exit: tuple[int, int] = (current_seg, 1 - enter_side)
+
+        while True:
+            if used[current_seg]:
+                break
+            used[current_seg] = True
+            group.append(current_seg)
+
+            arr = arrays[current_seg]
+            oriented = arr if enter_side == 0 else arr[::-1]
+            if len(points_acc) == 0:
+                points_acc.extend((float(x), float(y)) for x, y in oriented)
+            else:
+                points_acc.extend((float(x), float(y)) for x, y in oriented[1:])
+
+            exit_side = 1 - enter_side
+            last_exit = (current_seg, exit_side)
+            next_endpoint = transition.get((current_seg, exit_side))
+            if next_endpoint is None:
+                break
+
+            next_seg, next_side = next_endpoint
+            if used[next_seg]:
+                break
+            current_seg = int(next_seg)
+            enter_side = int(next_side)
+
+        end_node = _node_of_endpoint(last_exit[0], last_exit[1])
+
+        if not points_acc:
+            idx = group[0]
+            merged_segments.append(segments[idx])
+            merged_pairs.append(node_pairs[idx])
+            merged_groups.append(group)
+            return
+
+        cleaned: list[tuple[float, float]] = [points_acc[0]]
+        for p in points_acc[1:]:
+            if abs(p[0] - cleaned[-1][0]) <= 1e-9 and abs(p[1] - cleaned[-1][1]) <= 1e-9:
+                continue
+            cleaned.append(p)
+
+        if len(cleaned) < 2:
+            idx = group[0]
+            merged_segments.append(segments[idx])
+            merged_pairs.append(node_pairs[idx])
+            merged_groups.append(group)
+            return
+
+        merged_segments.append(Polyline2D(points=cleaned))
+        merged_pairs.append((int(start_node), int(end_node)))
+        merged_groups.append(group)
+
+    # Open chains first: start at endpoints that are not transitionable.
+    for seg_idx in range(len(segments)):
+        for side in (0, 1):
+            if (seg_idx, side) in transition:
+                continue
+            _walk_chain(seg_idx, side)
+
+    # Remaining segments are closed rings (all degree-2 transitionable).
+    for seg_idx in range(len(segments)):
+        if used[seg_idx]:
+            continue
+        _walk_chain(seg_idx, 0)
+
+    return merged_segments, merged_pairs, merged_groups

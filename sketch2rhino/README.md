@@ -5,11 +5,14 @@ A local tool that converts a planar sketch image into one or more editable open 
 ## Versioning
 
 - Rule: every software update must bump the version and be logged in README.
-- Current version: `0.2.8` (2026-02-27)
+- Rule: any behavior change that affects future usage/reading decisions must update README in the same change.
+- Current version: `0.2.11` (2026-02-28)
 - Latest changes:
-  - Update-check logs now distinguish clearly between `current version` and `feed latest` to avoid false “already latest 0.2.4” interpretation.
-  - Desktop macOS packager now enforces version bump before packaging (unless explicit override), and still auto-cleans old release artifacts.
-  - Repacked desktop deliverables for this release; Windows packaging flow remains the same GitHub Actions workflow.
+  - `polyline_only` keeps filtering disabled to preserve straight segments (no `min_length/max_curves` truncation).
+  - `nurbs_only` now uses a relaxed multi-path filter policy (soft min-length, no `max_curves` cap) plus median+close binary cleanup for smoother curve continuity.
+  - `mixed` now uses a relaxed multi-path filter policy (soft min-length, no `max_curves` cap), plus close-op smoothing and stronger spur-prune floor before skeletonization.
+  - `report.json` now includes `alignment_px` metrics to quantify geometry-vs-skeleton pixel alignment.
+  - Added/updated regression tests for mode-dependent path-filter strategy.
 
 ## What it does
 Input:
@@ -115,6 +118,21 @@ cd /Users/mac/Documents/RU-LineArt/sketch2rhino
 .venv/bin/python -m pytest -q
 ```
 
+## Mode Baseline Images
+
+From now on, use fixed test images per geometry mode:
+
+- `polyline_only` -> `data/samples/直线测试图.jpg`
+- `nurbs_only` -> `data/samples/曲线测试图.jpg`
+- `mixed` -> `data/samples/混合测试图.jpg`
+
+Run all three mode baselines in one command:
+
+```bash
+cd /Users/mac/Documents/RU-LineArt/sketch2rhino
+./scripts/run_mode_baseline_images.sh
+```
+
 ## Local API (Agent Discoverability)
 
 Start the local API server:
@@ -163,11 +181,17 @@ The tool supports two path-count modes via `configs/default.yaml`:
 
 Geometry export mode is independent from path count:
 
-- `fit.geometry_mode: "mixed"` (default): auto classify each segment to Polyline or NURBS.
-- `fit.geometry_mode: "polyline_only"`: force all exported geometry to Polyline.
-- `fit.geometry_mode: "nurbs_only"`: force all exported geometry to NURBS.
+- `fit.geometry_mode: "mixed"` (default): keep mixed strategy and auto classify each segment to Polyline or NURBS.
+- `fit.geometry_mode: "polyline_only"`: force segmentation on; corners are segmented; export Polyline geometry; path filtering is disabled to retain straight strokes.
+- `fit.geometry_mode: "nurbs_only"`: force segmentation off; each extracted path is fitted as a smooth open NURBS; binarized mask gets median+close cleanup; multi-path filtering is relaxed (no hard `max_curves` cap).
 
 You can set `fit.geometry_mode` in YAML, or override on CLI with `--geometry-mode`.
+
+Effective segmentation policy (final execution behavior):
+
+- `nurbs_only` -> segmentation forced `off` (ignores `fit.segment.enable`)
+- `polyline_only` -> segmentation forced `on` (ignores `fit.segment.enable`)
+- `mixed` -> follows `fit.segment.enable`
 
 Multi-mode controls:
 
@@ -177,6 +201,11 @@ Multi-mode controls:
 - `output.multi.sort_by`: currently supports `length`.
 - `output.multi.preserve_junctions`: keep detected junction anchors in simplification/fitting.
 - `output.multi.junction_snap_radius_px`: snap nearby stroke points to the same junction anchor.
+
+Effective mode overrides for multi-path filtering:
+- `polyline_only`: disables filtering (`min_length=0`, no cap).
+- `nurbs_only`: relaxed filtering (`min_length` clamped to a small value, no `max_curves` cap).
+- `mixed`: relaxed filtering (`min_length` clamped to a small value, no `max_curves` cap).
 
 For multi-mode across disjoint parts, keep:
 
@@ -232,7 +261,7 @@ Recommended smoothing-first defaults (already reflected in `configs/default.yaml
 - `fit.simplify.smooth_enable: false`
 - `fit.simplify.smooth_window: 7`
 - `fit.simplify.smooth_passes: 1`
-- `fit.segment.enable: true` (split mixed straight/curved strokes into multiple segments)
+- `fit.segment.enable: true` (effective for `mixed`; ignored by forced behavior in `nurbs_only` / `polyline_only`)
 - `fit.segment.corner_split_angle_deg: 45.0`
 - `fit.segment.corner_scales_px: [6, 12, 24]` (multi-scale turning-angle detection)
 - `fit.segment.fillet_enable: true` (detect rounded corner transitions and split at tangency-like boundaries)
@@ -315,9 +344,18 @@ If `pytest` resolves to something like `/opt/anaconda3/bin/pytest`, you are not 
 4. Fit:
 - optional stroke stabilization (Procreate-like anti-jitter)
 - simplify polyline
-- split each path into piecewise segments (corner/transition/anchor aware)
-- snap segment endpoints to shared nodes (for post-edit Join)
-- auto classify stroke geometry:
+- mode-aware image conditioning before fit:
+  - `nurbs_only`: stronger binary continuity enhancement
+  - `mixed`: light binary smoothing + higher spur-prune floor for smoother skeleton
+- segmentation policy by geometry mode:
+  - `nurbs_only`: no split; fit whole paths directly
+  - `polyline_only`: force split for corners/turns
+  - `mixed`: split behavior controlled by `fit.segment.enable`
+- if split is enabled:
+  - split paths into piecewise segments (corner/transition/anchor aware)
+  - snap segment endpoints to shared nodes (for post-edit Join)
+  - optional collinear join + post-join smoothing
+- geometry fitting:
   - straight / hard-edge -> Polyline (PL)
   - smooth curvy -> open B-spline / NURBS (control points ≤ 50, best-effort)
 
@@ -344,7 +382,7 @@ If `--debug` is provided, the tool saves:
 - `01_binarized.png`
 - `02_skeleton.png`
 - `03_path_overlay.png` (raw extracted paths before segment split/fitting)
-- `03_segment_overlay.png` (post-split segments that are actually sent to fitting/export)
+- `03_segment_overlay.png` (actual fitting inputs; segmented pieces when split is on, full paths when split is off)
 - `04_polyline.json`
 - `05_nurbs.json`
 - `report.json` (timings, counts, warnings)

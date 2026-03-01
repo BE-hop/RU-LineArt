@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 from time import perf_counter
+from typing import Callable
 
 import cv2
 import numpy as np
@@ -21,7 +22,12 @@ from sketch2rhino.debug.overlays import save_path_overlay
 from sketch2rhino.export.rhino3dm_writer import write_3dm, write_3dm_many
 from sketch2rhino.fit.nurbs_fit import fit_open_nurbs, fit_open_polyline, should_use_polyline_geometry
 from sketch2rhino.fit.polyline_simplify import simplify_polyline
-from sketch2rhino.fit.segment_split import anchors_for_segment, snap_segment_endpoints, split_polyline_into_segments
+from sketch2rhino.fit.segment_split import (
+    anchors_for_segment,
+    join_collinear_segments,
+    snap_segment_endpoints,
+    split_polyline_into_segments,
+)
 from sketch2rhino.fit.stroke_stabilize import stabilize_polyline
 from sketch2rhino.topo.graph_build import build_stroke_graph
 from sketch2rhino.topo.path_extract import (
@@ -124,6 +130,30 @@ def _polyline_anchor_points(
     return merged
 
 
+def _moving_average_polyline(polyline: Polyline2D, window: int, passes: int) -> Polyline2D:
+    arr = polyline.as_array()
+    if len(arr) < 3:
+        return polyline
+
+    w = max(3, int(window))
+    if w % 2 == 0:
+        w += 1
+    p = max(1, int(passes))
+    pad = w // 2
+    kernel = np.ones(w, dtype=np.float64) / float(w)
+
+    out = arr.copy()
+    for _ in range(p):
+        xpad = np.pad(out[:, 0], (pad, pad), mode="edge")
+        ypad = np.pad(out[:, 1], (pad, pad), mode="edge")
+        out[:, 0] = np.convolve(xpad, kernel, mode="valid")
+        out[:, 1] = np.convolve(ypad, kernel, mode="valid")
+        out[0] = arr[0]
+        out[-1] = arr[-1]
+
+    return Polyline2D(points=[(float(x), float(y)) for x, y in out])
+
+
 def _sample_nurbs_curve(spec: NurbsSpec, n_samples: int) -> np.ndarray:
     n = max(64, int(n_samples))
     knots = np.asarray(spec.knots, dtype=np.float64)
@@ -170,6 +200,165 @@ def _fit_geometry_for_segment(
     if should_use_polyline_geometry(polyline, cfg.fit):
         return fit_open_polyline(polyline, cfg.fit), "polyline"
     return fit_open_nurbs(polyline, cfg.fit, anchors=anchors), "nurbs"
+
+
+def _resolve_effective_segment_enable(cfg: AppConfig) -> tuple[bool, str]:
+    mode = str(cfg.fit.geometry_mode).strip().lower()
+    if mode == "nurbs_only":
+        return False, "forced_off_by_geometry_mode_nurbs_only"
+    if mode == "polyline_only":
+        return True, "forced_on_by_geometry_mode_polyline_only"
+    return bool(cfg.fit.segment.enable), "from_fit.segment.enable"
+
+
+def _resolve_effective_path_filter(cfg: AppConfig) -> tuple[float, int, str]:
+    mode = str(cfg.fit.geometry_mode).strip().lower()
+    if mode == "polyline_only":
+        return 0.0, 0, "disabled_for_geometry_mode_polyline_only"
+    if mode == "nurbs_only":
+        # Keep curve mode complete: avoid hard truncation and only trim tiny speckles.
+        return min(float(cfg.output.multi.min_length_px), 4.0), 0, "relaxed_for_geometry_mode_nurbs_only"
+    if mode == "mixed":
+        # Mixed mode in multi-output should keep full recall; downstream segment filtering handles cleanup.
+        return 0.0, 0, "disabled_for_geometry_mode_mixed"
+    return float(cfg.output.multi.min_length_px), int(cfg.output.multi.max_curves), "from_output.multi"
+
+
+def _resolve_effective_component_choice(cfg: AppConfig) -> tuple[str, str]:
+    mode = str(cfg.output.mode).strip().lower()
+    requested = str(cfg.path_extract.choose_component).strip().lower()
+    geometry_mode = str(cfg.fit.geometry_mode).strip().lower()
+
+    if mode == "multi" and geometry_mode == "mixed":
+        # Mixed mode targets visual completeness; keep all disconnected components.
+        return "all", "forced_all_for_geometry_mode_mixed"
+    if requested in {"largest", "all"}:
+        return requested, "from_path_extract.choose_component"
+    return "largest", "fallback_to_largest_for_invalid_path_extract.choose_component"
+
+
+def _enhance_binary_for_geometry_mode(binary: np.ndarray, geometry_mode: str) -> np.ndarray:
+    mode = str(geometry_mode).strip().lower()
+    if mode not in {"mixed", "nurbs_only", "polyline_only"}:
+        return binary
+
+    mask_u8 = (binary.astype(np.uint8) > 0).astype(np.uint8) * 255
+
+    if mode == "polyline_only":
+        # Straight mode: suppress speckles/noisy burrs while keeping long line continuity.
+        blurred = cv2.GaussianBlur(mask_u8, (3, 3), sigmaX=0.7)
+        _, thresh = cv2.threshold(blurred, 127, 255, cv2.THRESH_BINARY)
+        kernel = np.ones((3, 3), dtype=np.uint8)
+        opened = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel, iterations=1)
+        closed = cv2.morphologyEx(opened, cv2.MORPH_CLOSE, kernel, iterations=1)
+        return (closed > 0).astype(np.uint8)
+
+    if mode == "nurbs_only":
+        # Curve mode: favor continuous, cleaner strokes before skeletonization.
+        blurred = cv2.GaussianBlur(mask_u8, (3, 3), sigmaX=1.0)
+        _, thresh = cv2.threshold(blurred, 127, 255, cv2.THRESH_BINARY)
+        denoised = cv2.medianBlur(thresh, 3)
+        kernel = np.ones((3, 3), dtype=np.uint8)
+        closed = cv2.morphologyEx(denoised, cv2.MORPH_CLOSE, kernel, iterations=1)
+        return (closed > 0).astype(np.uint8)
+
+    # Mixed mode: light smoothing to reduce skeleton jaggies while keeping topology.
+    blurred = cv2.GaussianBlur(mask_u8, (3, 3), sigmaX=0.8)
+    _, thresh = cv2.threshold(blurred, 127, 255, cv2.THRESH_BINARY)
+    kernel = np.ones((3, 3), dtype=np.uint8)
+    closed = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel, iterations=1)
+    return (closed > 0).astype(np.uint8)
+
+
+def _points_to_pixel_path(points_xy: list[tuple[float, float]], shape: tuple[int, int]) -> list[tuple[int, int]]:
+    h, w = shape
+    pts: list[tuple[int, int]] = []
+    for x, y in points_xy:
+        col = int(round(float(x)))
+        row = int(round(-float(y)))
+        if 0 <= row < h and 0 <= col < w:
+            pts.append((col, row))
+    if not pts:
+        return []
+
+    deduped: list[tuple[int, int]] = [pts[0]]
+    for p in pts[1:]:
+        if p != deduped[-1]:
+            deduped.append(p)
+    return deduped
+
+
+def _rasterize_geometries_mask(
+    geometries: list[CurveGeometry],
+    shape: tuple[int, int],
+) -> np.ndarray:
+    canvas = np.zeros(shape, dtype=np.uint8)
+    for geom in geometries:
+        if isinstance(geom, NurbsSpec):
+            sample_n = max(64, len(geom.control_points) * 12)
+            arr = _sample_nurbs_curve(geom, sample_n)
+            points_xy = [(float(x), float(y)) for x, y in arr]
+        else:
+            points_xy = [(float(x), float(y)) for x, y in geom.points]
+
+        pixel_path = _points_to_pixel_path(points_xy, shape)
+        if len(pixel_path) >= 2:
+            arr_i = np.asarray(pixel_path, dtype=np.int32).reshape((-1, 1, 2))
+            cv2.polylines(canvas, [arr_i], isClosed=False, color=255, thickness=1)
+        elif len(pixel_path) == 1:
+            cv2.circle(canvas, pixel_path[0], radius=0, color=255, thickness=-1)
+    return canvas
+
+
+def _geometry_alignment_metrics(
+    geometries: list[CurveGeometry],
+    skeleton: np.ndarray,
+) -> dict[str, object]:
+    skel = (skeleton > 0).astype(np.uint8)
+    curve = (_rasterize_geometries_mask(geometries, skeleton.shape) > 0).astype(np.uint8)
+
+    skel_px = int(np.count_nonzero(skel))
+    curve_px = int(np.count_nonzero(curve))
+    if skel_px == 0 or curve_px == 0:
+        return {
+            "skeleton_px": skel_px,
+            "curve_px": curve_px,
+            "overlap_px": 0,
+            "precision_exact": 0.0,
+            "recall_exact": 0.0,
+            "precision_t1px": 0.0,
+            "recall_t1px": 0.0,
+            "mean_curve_to_skeleton_px": 0.0,
+            "p95_curve_to_skeleton_px": 0.0,
+            "max_curve_to_skeleton_px": 0.0,
+        }
+
+    overlap = int(np.count_nonzero((skel > 0) & (curve > 0)))
+    precision_exact = float(overlap / max(1, curve_px))
+    recall_exact = float(overlap / max(1, skel_px))
+
+    dist_to_skeleton = cv2.distanceTransform((1 - skel).astype(np.uint8), cv2.DIST_L2, 3)
+    curve_dist = dist_to_skeleton[curve > 0]
+    dist_to_curve = cv2.distanceTransform((1 - curve).astype(np.uint8), cv2.DIST_L2, 3)
+    skel_dist = dist_to_curve[skel > 0]
+
+    if curve_dist.size == 0:
+        curve_dist = np.asarray([0.0], dtype=np.float32)
+    if skel_dist.size == 0:
+        skel_dist = np.asarray([0.0], dtype=np.float32)
+
+    return {
+        "skeleton_px": skel_px,
+        "curve_px": curve_px,
+        "overlap_px": overlap,
+        "precision_exact": precision_exact,
+        "recall_exact": recall_exact,
+        "precision_t1px": float(np.mean(curve_dist <= 1.0)),
+        "recall_t1px": float(np.mean(skel_dist <= 1.0)),
+        "mean_curve_to_skeleton_px": float(np.mean(curve_dist)),
+        "p95_curve_to_skeleton_px": float(np.percentile(curve_dist, 95.0)),
+        "max_curve_to_skeleton_px": float(np.max(curve_dist)),
+    }
 
 
 def _filter_multi_output_polylines(
@@ -253,45 +442,109 @@ def run_pipeline(
     output_path: Path,
     cfg: AppConfig,
     debug_dir: Path | None = None,
+    progress_cb: Callable[[float, str], None] | None = None,
 ) -> ExportResult:
+    def _report_progress(value: float, stage: str) -> None:
+        if progress_cb is None:
+            return
+        try:
+            clipped = float(np.clip(float(value), 0.0, 1.0))
+            progress_cb(clipped, stage)
+        except Exception:
+            return
+
+    def _report_loop_progress(base: float, span: float, index: int, total: int, stage: str) -> None:
+        if total <= 0:
+            _report_progress(base + span, stage)
+            return
+        step = max(1, int(total // 120))
+        cur = int(index) + 1
+        if cur >= total or cur % step == 0:
+            _report_progress(base + span * (float(cur) / float(total)), stage)
+
     report: dict[str, object] = {"warnings": [], "timings": {}, "brand": brand_signature()}
+    geometry_mode = str(cfg.fit.geometry_mode).strip().lower()
+    report["geometry_mode"] = geometry_mode
+    segment_cfg_effective = cfg.fit.segment.model_copy(deep=True)
+    simplify_cfg_effective = cfg.fit.simplify.model_copy(deep=True)
+    if geometry_mode == "mixed":
+        # Mixed mode focuses on geometry recall/fidelity:
+        # avoid operations that can shift lines away from the traced skeleton.
+        segment_cfg_effective.pre_simplify_enable = True
+        segment_cfg_effective.pre_simplify_epsilon_px = 0.35
+        simplify_cfg_effective.epsilon_px = 0.0
+        segment_cfg_effective.endpoint_snap_tolerance_px = 1e-6
+        segment_cfg_effective.join_enable = True
+        segment_cfg_effective.join_angle_tolerance_deg = max(float(segment_cfg_effective.join_angle_tolerance_deg), 179.0)
+        segment_cfg_effective.post_join_smooth_enable = False
+    report["mixed_fidelity_profile"] = {
+        "active": geometry_mode == "mixed",
+        "pre_simplify_enable": bool(segment_cfg_effective.pre_simplify_enable),
+        "simplify_epsilon_px": float(simplify_cfg_effective.epsilon_px),
+        "endpoint_snap_tolerance_px": float(segment_cfg_effective.endpoint_snap_tolerance_px),
+        "join_enable": bool(segment_cfg_effective.join_enable),
+        "post_join_smooth_enable": bool(segment_cfg_effective.post_join_smooth_enable),
+    }
+    _report_progress(0.0, "start")
 
     t0 = perf_counter()
     gray = load_grayscale_image(image_path)
     report["timings"]["load_image"] = perf_counter() - t0
+    _report_progress(0.05, "load_image")
 
     t1 = perf_counter()
     binary = preprocess_image(gray, cfg.preprocess)
+    binary = _enhance_binary_for_geometry_mode(binary, geometry_mode)
     report["timings"]["preprocess"] = perf_counter() - t1
+    _report_progress(0.10, "preprocess")
 
     t2 = perf_counter()
-    skeleton = skeletonize_image(binary, cfg.skeleton)
+    skeleton_cfg = cfg.skeleton.model_copy(deep=True)
+    if geometry_mode == "mixed":
+        # Mixed mode: prune short burrs a bit more aggressively for smoother skeleton overlays.
+        skeleton_cfg.spur_min_length_px = max(int(skeleton_cfg.spur_min_length_px), 22)
+    skeleton = skeletonize_image(binary, skeleton_cfg)
     report["timings"]["skeletonize"] = perf_counter() - t2
+    _report_progress(0.18, "skeletonize")
 
     t3 = perf_counter()
     mode = cfg.output.mode.lower()
     if mode not in {"single", "multi"}:
         raise ValueError(f"Unsupported output mode: {cfg.output.mode}")
 
+    component_choice, component_choice_reason = _resolve_effective_component_choice(cfg)
+    report["component_choice"] = {
+        "requested": str(cfg.path_extract.choose_component),
+        "effective": component_choice,
+        "reason": component_choice_reason,
+    }
+    if component_choice_reason == "forced_all_for_geometry_mode_mixed" and str(cfg.path_extract.choose_component).strip().lower() != "all":
+        report["warnings"].append("path_extract.choose_component forced to all in mixed mode")
+
     if mode == "single":
-        components = [choose_main_component(skeleton, cfg.path_extract.choose_component)]
+        components = [choose_main_component(skeleton, component_choice)]
     else:
-        if cfg.path_extract.choose_component == "largest":
+        if component_choice == "largest":
             components = [choose_main_component(skeleton, "largest")]
         else:
             components = split_components(skeleton)
             if not components:
                 components = [skeleton.copy()]
+    _report_progress(0.22, "split_components")
 
-    graphs = [build_stroke_graph(comp) for comp in components]
+    graphs: list[object] = []
+    for i, comp in enumerate(components):
+        graphs.append(build_stroke_graph(comp))
+        _report_loop_progress(0.22, 0.08, i, len(components), "build_graphs")
     polylines: list[Polyline2D] = []
     raw_path_candidates: list[Polyline2D] = []
 
     if mode == "single":
         polylines.append(extract_main_open_path(components[0], graphs[0], cfg.path_extract))
         raw_path_candidates = list(polylines)
+        _report_progress(0.40, "extract_paths")
     else:
-        for comp, graph in zip(components, graphs, strict=True):
+        for i, (comp, graph) in enumerate(zip(components, graphs, strict=True)):
             raw_path_candidates.extend(
                 extract_open_paths(
                     skeleton=comp,
@@ -302,12 +555,28 @@ def run_pipeline(
                     include_loops=cfg.output.multi.include_loops,
                 )
             )
-        polylines, path_stats, path_warnings = _filter_multi_output_polylines(
-            candidates=raw_path_candidates,
-            min_length_px=float(cfg.output.multi.min_length_px),
-            max_curves=int(cfg.output.multi.max_curves),
-            sort_by=str(cfg.output.multi.sort_by),
-        )
+            _report_loop_progress(0.30, 0.08, i, len(components), "extract_paths")
+        min_len_effective, max_curves_effective, filter_policy = _resolve_effective_path_filter(cfg)
+        if filter_policy == "disabled_for_geometry_mode_polyline_only":
+            polylines = list(raw_path_candidates)
+            path_stats: dict[str, object] = {
+                "raw_candidate_count": int(len(raw_path_candidates)),
+                "min_length_px": float(min_len_effective),
+                "kept_after_min_length": int(len(raw_path_candidates)),
+                "dropped_by_min_length": 0,
+                "max_curves": int(max_curves_effective),
+                "kept_final_count": int(len(raw_path_candidates)),
+                "dropped_by_max_curves": 0,
+            }
+            path_warnings: list[str] = []
+        else:
+            polylines, path_stats, path_warnings = _filter_multi_output_polylines(
+                candidates=raw_path_candidates,
+                min_length_px=min_len_effective,
+                max_curves=max_curves_effective,
+                sort_by=str(cfg.output.multi.sort_by),
+            )
+        path_stats["filter_policy"] = filter_policy
         report["path_extract_stats"] = path_stats
         report["warnings"].extend(path_warnings)
         report["path_extract_stats"]["coverage_raw_vs_skeleton"] = _polyline_pixel_coverage(
@@ -318,6 +587,7 @@ def run_pipeline(
             polylines,
             skeleton,
         )
+        _report_progress(0.40, "extract_paths")
 
     if not polylines:
         raise ValueError("No valid path extracted from skeleton")
@@ -332,6 +602,7 @@ def run_pipeline(
             junctions_xy=junctions_xy,
             snap_radius=cfg.output.multi.junction_snap_radius_px,
         )
+    _report_progress(0.44, "preserve_junctions")
 
     report["timings"]["path_extract"] = perf_counter() - t3
 
@@ -347,50 +618,183 @@ def run_pipeline(
     segment_polylines: list[Polyline2D] = []
     segment_anchors: list[list[tuple[float, float]]] = []
     segment_sources: list[tuple[int, int]] = []  # (source_curve_idx, local_segment_idx)
-    for i, polyline in enumerate(stabilized_list):
-        base_anchors = _polyline_anchor_points(
-            polyline=polyline,
-            protected_points=protected_points[i] if i < len(protected_points) else None,
-        )
-        segments = split_polyline_into_segments(
-            polyline,
-            cfg.fit.segment,
-            forced_break_points=base_anchors,
-        )
-        for j, seg in enumerate(segments):
-            seg_anchor_candidates = anchors_for_segment(
-                seg,
-                anchors=base_anchors,
-                tolerance_px=float(cfg.fit.segment.forced_break_tolerance_px),
-            )
-            seg_simplified = simplify_polyline(
-                seg,
-                cfg.fit.simplify,
-                protected_points=seg_anchor_candidates,
-            )
-            segment_polylines.append(seg_simplified)
-            segment_anchors.append(_polyline_anchor_points(seg_simplified, seg_anchor_candidates))
-            segment_sources.append((i, j))
+    segment_enable_effective, segment_enable_reason = _resolve_effective_segment_enable(cfg)
+    report["segment_strategy"] = {
+        "geometry_mode": str(cfg.fit.geometry_mode),
+        "segment_enable_config": bool(cfg.fit.segment.enable),
+        "segment_enable_effective": bool(segment_enable_effective),
+        "reason": segment_enable_reason,
+        "effective_overrides": {
+            "pre_simplify_enable": bool(segment_cfg_effective.pre_simplify_enable),
+            "simplify_epsilon_px": float(simplify_cfg_effective.epsilon_px),
+            "endpoint_snap_tolerance_px": float(segment_cfg_effective.endpoint_snap_tolerance_px),
+            "join_enable": bool(segment_cfg_effective.join_enable),
+            "post_join_smooth_enable": bool(segment_cfg_effective.post_join_smooth_enable),
+        },
+    }
 
-    if not segment_polylines:
-        raise ValueError("No valid segments after split")
-
-    node_pairs: list[tuple[int, int]] = [(-1, -1) for _ in segment_polylines]
+    node_pairs: list[tuple[int, int]] = []
     node_centers: list[tuple[float, float]] = []
-    if float(cfg.fit.segment.endpoint_snap_tolerance_px) > 0.0:
-        segment_polylines, node_pairs, node_centers = snap_segment_endpoints(
-            segment_polylines,
-            tolerance_px=float(cfg.fit.segment.endpoint_snap_tolerance_px),
-        )
-        segment_anchors = [
-            _polyline_anchor_points(segment_polylines[i], segment_anchors[i]) for i in range(len(segment_polylines))
-        ]
+    join_stats: dict[str, object] = {
+        "enabled": False,
+        "before_count": 0,
+        "after_count": 0,
+        "merged_segments": 0,
+        "chains_joined": 0,
+        "max_chain_len": 1,
+        "post_join_smoothed": False,
+    }
+
+    if segment_enable_effective:
+        for i, polyline in enumerate(stabilized_list):
+            base_anchors_initial = _polyline_anchor_points(
+                polyline=polyline,
+                protected_points=protected_points[i] if i < len(protected_points) else None,
+            )
+            polyline_for_split = polyline
+            if bool(segment_cfg_effective.pre_simplify_enable):
+                pre_cfg = simplify_cfg_effective.model_copy(deep=True)
+                pre_eps = float(segment_cfg_effective.pre_simplify_epsilon_px)
+                if pre_eps > 0.0:
+                    pre_cfg.epsilon_px = pre_eps
+                polyline_for_split = simplify_polyline(
+                    polyline_for_split,
+                    pre_cfg,
+                    protected_points=base_anchors_initial,
+                )
+            base_anchors = _polyline_anchor_points(
+                polyline=polyline_for_split,
+                protected_points=base_anchors_initial,
+            )
+            segments = split_polyline_into_segments(
+                polyline_for_split,
+                segment_cfg_effective,
+                forced_break_points=base_anchors,
+            )
+            for j, seg in enumerate(segments):
+                seg_anchor_candidates = anchors_for_segment(
+                    seg,
+                    anchors=base_anchors,
+                    tolerance_px=float(segment_cfg_effective.forced_break_tolerance_px),
+                )
+                seg_simplified = simplify_polyline(
+                    seg,
+                    simplify_cfg_effective,
+                    protected_points=seg_anchor_candidates,
+                )
+                segment_polylines.append(seg_simplified)
+                segment_anchors.append(_polyline_anchor_points(seg_simplified, seg_anchor_candidates))
+                segment_sources.append((i, j))
+            _report_loop_progress(0.44, 0.26, i, len(stabilized_list), "split_and_simplify")
+
+        if not segment_polylines:
+            raise ValueError("No valid segments after split")
+
+        node_pairs = [(-1, -1) for _ in segment_polylines]
+        if float(segment_cfg_effective.endpoint_snap_tolerance_px) > 0.0:
+            segment_polylines, node_pairs, node_centers = snap_segment_endpoints(
+                segment_polylines,
+                tolerance_px=float(segment_cfg_effective.endpoint_snap_tolerance_px),
+            )
+            segment_anchors = [
+                _polyline_anchor_points(segment_polylines[i], segment_anchors[i]) for i in range(len(segment_polylines))
+            ]
+        _report_progress(0.75, "endpoint_snap")
+
+        join_stats = {
+            "enabled": bool(segment_cfg_effective.join_enable),
+            "before_count": int(len(segment_polylines)),
+            "after_count": int(len(segment_polylines)),
+            "merged_segments": 0,
+            "chains_joined": 0,
+            "max_chain_len": 1,
+            "post_join_smoothed": False,
+        }
+        if bool(segment_cfg_effective.join_enable) and segment_polylines and node_pairs:
+            joined_polylines, joined_node_pairs, joined_groups = join_collinear_segments(
+                segments=segment_polylines,
+                node_pairs=node_pairs,
+                angle_tolerance_deg=float(segment_cfg_effective.join_angle_tolerance_deg),
+            )
+            if joined_polylines:
+                rebuilt_anchors: list[list[tuple[float, float]]] = []
+                rebuilt_sources: list[tuple[int, int]] = []
+                max_chain = 1
+                chains_joined = 0
+                for i, group in enumerate(joined_groups):
+                    merged_anchor_candidates: list[tuple[float, float]] = []
+                    merged_sources: list[tuple[int, int]] = []
+                    for idx in group:
+                        if 0 <= idx < len(segment_anchors):
+                            merged_anchor_candidates.extend(segment_anchors[idx])
+                        if 0 <= idx < len(segment_sources):
+                            merged_sources.append(segment_sources[idx])
+                    rebuilt_anchors.append(_polyline_anchor_points(joined_polylines[i], merged_anchor_candidates))
+                    rebuilt_sources.append(merged_sources[0] if merged_sources else (0, 0))
+                    chain_len = len(group)
+                    if chain_len > 1:
+                        chains_joined += 1
+                        max_chain = max(max_chain, chain_len)
+
+                segment_polylines = joined_polylines
+                node_pairs = joined_node_pairs
+                segment_anchors = rebuilt_anchors
+                segment_sources = rebuilt_sources
+                join_stats = {
+                    "enabled": True,
+                    "before_count": int(sum(len(g) for g in joined_groups)),
+                    "after_count": int(len(joined_polylines)),
+                    "merged_segments": int(sum(max(0, len(g) - 1) for g in joined_groups)),
+                    "chains_joined": int(chains_joined),
+                    "max_chain_len": int(max_chain),
+                    "post_join_smoothed": False,
+                }
+        report["join_stats"] = join_stats
+        _report_progress(0.80, "join_segments")
+
+        if bool(segment_cfg_effective.post_join_smooth_enable) and segment_polylines:
+            smoothed_polylines: list[Polyline2D] = []
+            smoothed_anchors: list[list[tuple[float, float]]] = []
+            for i, seg in enumerate(segment_polylines):
+                smoothed = _moving_average_polyline(
+                    seg,
+                    window=int(segment_cfg_effective.post_join_smooth_window),
+                    passes=int(segment_cfg_effective.post_join_smooth_passes),
+                )
+                smoothed_polylines.append(smoothed)
+                smoothed_anchors.append(_polyline_anchor_points(smoothed, segment_anchors[i]))
+                _report_loop_progress(0.80, 0.04, i, len(segment_polylines), "post_join_smooth")
+            segment_polylines = smoothed_polylines
+            segment_anchors = smoothed_anchors
+            join_stats["post_join_smoothed"] = True
+        _report_progress(0.84, "post_join_smooth")
+    else:
+        for i, polyline in enumerate(stabilized_list):
+            full_anchor_candidates = _polyline_anchor_points(
+                polyline=polyline,
+                protected_points=protected_points[i] if i < len(protected_points) else None,
+            )
+            simplified = simplify_polyline(
+                polyline,
+                simplify_cfg_effective,
+                protected_points=full_anchor_candidates,
+            )
+            segment_polylines.append(simplified)
+            segment_anchors.append(_polyline_anchor_points(simplified, full_anchor_candidates))
+            segment_sources.append((i, 0))
+            _report_loop_progress(0.44, 0.26, i, len(stabilized_list), "split_and_simplify")
+
+        node_pairs = [(-1, -1) for _ in segment_polylines]
+        report["join_stats"] = join_stats
+        _report_progress(0.75, "endpoint_snap")
+        _report_progress(0.80, "join_segments")
+        _report_progress(0.84, "post_join_smooth")
 
     filtered_polylines: list[Polyline2D] = []
     filtered_anchors: list[list[tuple[float, float]]] = []
     filtered_sources: list[tuple[int, int]] = []
     filtered_node_pairs: list[tuple[int, int]] = []
-    min_seg_len = max(0.0, float(cfg.fit.segment.min_length_px))
+    min_seg_len = max(0.0, float(segment_cfg_effective.min_length_px))
     dropped_by_min_seg_len = 0
     dropped_degenerate = 0
     for i, seg in enumerate(segment_polylines):
@@ -421,13 +825,44 @@ def run_pipeline(
         )
     if not segment_polylines:
         raise ValueError("No valid segments after endpoint snap")
+    _report_progress(0.86, "filter_segments")
 
     geometry_list: list[CurveGeometry] = []
     geometry_types: list[str] = []
+    fitted_polylines: list[Polyline2D] = []
+    fitted_anchors: list[list[tuple[float, float]]] = []
+    fitted_sources: list[tuple[int, int]] = []
+    fitted_node_pairs: list[tuple[int, int]] = []
+    dropped_before_fit = 0
+
     for i, polyline in enumerate(segment_polylines):
-        geometry, geometry_type = _fit_geometry_for_segment(polyline, segment_anchors[i], cfg)
+        try:
+            geometry, geometry_type = _fit_geometry_for_segment(polyline, segment_anchors[i], cfg)
+        except ValueError as exc:
+            # Keep conversion robust when no-filter modes pass tiny/degenerate candidates.
+            if "fewer than 2 valid points" in str(exc):
+                dropped_before_fit += 1
+                _report_loop_progress(0.86, 0.09, i, len(segment_polylines), "fit_geometry")
+                continue
+            raise
+
         geometry_list.append(geometry)
         geometry_types.append(geometry_type)
+        fitted_polylines.append(polyline)
+        fitted_anchors.append(segment_anchors[i])
+        fitted_sources.append(segment_sources[i])
+        fitted_node_pairs.append(node_pairs[i] if i < len(node_pairs) else (-1, -1))
+        _report_loop_progress(0.86, 0.09, i, len(segment_polylines), "fit_geometry")
+
+    if dropped_before_fit > 0:
+        report["warnings"].append(f"segments dropped before fit: -{dropped_before_fit}")
+    if not geometry_list:
+        raise ValueError("No valid segments for geometry fitting")
+
+    segment_polylines = fitted_polylines
+    segment_anchors = fitted_anchors
+    segment_sources = fitted_sources
+    node_pairs = fitted_node_pairs
     report["timings"]["fit"] = perf_counter() - t4
 
     node_ids_for_export: list[tuple[int, int]] | None = None
@@ -445,6 +880,7 @@ def run_pipeline(
     else:
         export_result = write_3dm_many(geometry_list, output_path, cfg.export, node_ids=node_ids_for_export)
     report["timings"]["export"] = perf_counter() - t5
+    _report_progress(0.99, "export_3dm")
     report["export_info"] = export_result.report
 
     point_counts = [_geometry_point_count(g) for g in geometry_list]
@@ -491,6 +927,8 @@ def run_pipeline(
             {"id": i, "x": float(x), "y": float(y), "degree": int(node_degree.get(i, 0))}
             for i, (x, y) in enumerate(node_centers)
         ]
+
+    report["alignment_px"] = _geometry_alignment_metrics(geometry_list, skeleton)
 
     anchor_stats: list[dict[str, object]] = []
     for i, geom in enumerate(geometry_list):
@@ -553,4 +991,5 @@ def run_pipeline(
         )
         save_report_json(report, dbg / "report.json")
 
+    _report_progress(1.0, "done")
     return ExportResult(output_path=export_result.output_path, report=report)

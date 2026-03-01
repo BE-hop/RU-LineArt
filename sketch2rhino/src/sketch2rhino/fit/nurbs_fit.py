@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import cv2
 import numpy as np
 from scipy.interpolate import splev, splprep
 
@@ -108,10 +109,17 @@ def _reduce_points_to_budget(points: np.ndarray, max_points: int) -> np.ndarray:
     low = 0.0
     high = max(1.0, diag)
     best: np.ndarray | None = None
+    pts32 = points.astype(np.float32).reshape(-1, 1, 2)
 
     for _ in range(24):
         mid = 0.5 * (low + high)
-        candidate = _rdp(points, mid)
+        approx = cv2.approxPolyDP(pts32, epsilon=float(mid), closed=False)
+        if approx is None or len(approx) == 0:
+            candidate = np.vstack([points[0], points[-1]])
+        else:
+            candidate = approx.reshape(-1, 2).astype(np.float64)
+            if len(candidate) < 2:
+                candidate = np.vstack([points[0], points[-1]])
         if len(candidate) > budget:
             low = mid
         else:
@@ -119,10 +127,12 @@ def _reduce_points_to_budget(points: np.ndarray, max_points: int) -> np.ndarray:
             high = mid
 
     if best is None:
-        best = _rdp(points, high)
-
+        best = _resample_by_arclength(points, budget)
     if len(best) > budget:
         best = _resample_by_arclength(points, budget)
+
+    best[0] = points[0]
+    best[-1] = points[-1]
     return best
 
 
