@@ -17,6 +17,10 @@ class BinarizeConfig(BaseModel):
     block_size: int = 31
     C: int = 7
     otsu_offset: float = 0.0
+    low_ink_recovery_enable: bool = True
+    low_ink_ratio_trigger: float = 0.025
+    low_ink_otsu_boost: float = 18.0
+    low_ink_min_component_px: int = 4
 
 
 class MorphConfig(BaseModel):
@@ -89,6 +93,9 @@ class SplineConfig(BaseModel):
     hard_edge_straight_max_deviation_px: float = 2.0
     hard_edge_straight_max_deviation_ratio: float = 0.02
     hard_edge_straight_max_turn_deg: float = 12.0
+    nurbs_only_soft_cp_ratio: float = 0.32
+    nurbs_only_soft_cp_min: int = 14
+    nurbs_only_smoothing_floor: float = 7.5
 
 
 class SegmentConfig(BaseModel):

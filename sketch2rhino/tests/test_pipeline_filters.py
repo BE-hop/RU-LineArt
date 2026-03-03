@@ -1,5 +1,7 @@
 import numpy as np
 
+from sketch2rhino.pipeline import _adaptive_spur_min_length
+from sketch2rhino.pipeline import _enhance_binary_for_geometry_mode
 from sketch2rhino.pipeline import _filter_multi_output_polylines
 from sketch2rhino.pipeline import _polyline_pixel_coverage
 from sketch2rhino.types import Polyline2D
@@ -59,3 +61,39 @@ def test_polyline_pixel_coverage_reports_recall_against_mask():
     assert cov["total_px"] == int(mask.sum())
     assert cov["covered_px"] > 0
     assert 0.0 < float(cov["ratio"]) < 1.0
+
+
+def test_enhance_binary_for_geometry_mode_keeps_thin_strokes():
+    binary = np.zeros((40, 40), dtype=np.uint8)
+    binary[20, 4:36] = 1
+    binary[6:34, 10] = 1
+
+    for mode in ("polyline_only", "nurbs_only", "mixed"):
+        out = _enhance_binary_for_geometry_mode(binary, mode)
+        assert out.dtype == np.uint8
+        assert int(out.sum()) >= int(binary.sum())
+        assert int(out[20, 4]) == 1
+        assert int(out[20, 35]) == 1
+
+
+def test_adaptive_spur_min_length_relaxes_when_ink_is_sparse():
+    sparse = np.zeros((100, 100), dtype=np.uint8)
+    sparse[50, 10:70] = 1  # 0.6% foreground
+    dense = np.zeros((100, 100), dtype=np.uint8)
+    dense[20:80, 20:80] = 1  # 36% foreground
+
+    assert _adaptive_spur_min_length(sparse, 18) == 3
+    assert _adaptive_spur_min_length(dense, 18) == 18
+
+
+def test_enhance_binary_mixed_dense_avoids_false_bridge_between_parallel_lines():
+    binary = np.zeros((120, 120), dtype=np.uint8)
+    binary[:, 40] = 1
+    binary[:, 42] = 1
+    # Raise foreground ratio above dense threshold so mixed mode skips bridging close-op.
+    binary[20:100, 70:115] = 1
+
+    out = _enhance_binary_for_geometry_mode(binary, "mixed")
+    assert out.dtype == np.uint8
+    # Gap column between the two vertical lines should stay empty.
+    assert int(np.count_nonzero(out[:, 41])) == 0

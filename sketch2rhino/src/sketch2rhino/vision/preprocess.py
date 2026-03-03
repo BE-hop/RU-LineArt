@@ -47,6 +47,26 @@ def _apply_denoise(gray: np.ndarray, cfg: PreprocessConfig) -> np.ndarray:
     return gray
 
 
+def _remove_small_components(binary_u8: np.ndarray, min_area_px: int) -> np.ndarray:
+    min_area = max(0, int(min_area_px))
+    if min_area <= 1:
+        return binary_u8
+
+    mask = (binary_u8 > 0).astype(np.uint8)
+    n_labels, labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
+    if n_labels <= 1:
+        return binary_u8
+
+    keep = np.zeros(n_labels, dtype=np.uint8)
+    keep[0] = 0
+    for idx in range(1, n_labels):
+        if int(stats[idx, cv2.CC_STAT_AREA]) >= min_area:
+            keep[idx] = 1
+
+    filtered = (keep[labels] > 0).astype(np.uint8) * 255
+    return filtered
+
+
 def _binarize(gray: np.ndarray, cfg: PreprocessConfig) -> np.ndarray:
     work = gray
     if not cfg.target_black_on_white:
@@ -56,6 +76,21 @@ def _binarize(gray: np.ndarray, cfg: PreprocessConfig) -> np.ndarray:
         otsu_t, _ = cv2.threshold(work, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
         t = float(np.clip(float(otsu_t) + float(getattr(cfg.binarize, "otsu_offset", 0.0)), 0.0, 255.0))
         _, binary = cv2.threshold(work, t, 255, cv2.THRESH_BINARY_INV)
+
+        if bool(getattr(cfg.binarize, "low_ink_recovery_enable", True)):
+            fg_ratio = float(np.count_nonzero(binary)) / float(binary.size)
+            trigger = max(0.0, float(getattr(cfg.binarize, "low_ink_ratio_trigger", 0.015)))
+            if fg_ratio <= trigger:
+                boost = max(0.0, float(getattr(cfg.binarize, "low_ink_otsu_boost", 14.0)))
+                t_soft = float(np.clip(t + boost, 0.0, 255.0))
+                if t_soft > t:
+                    _, binary_soft = cv2.threshold(work, t_soft, 255, cv2.THRESH_BINARY_INV)
+                    recovered = cv2.bitwise_and(binary_soft, cv2.bitwise_not(binary))
+                    recovered = _remove_small_components(
+                        recovered,
+                        int(getattr(cfg.binarize, "low_ink_min_component_px", 6)),
+                    )
+                    binary = cv2.bitwise_or(binary, recovered)
         return binary
 
     block_size = int(cfg.binarize.block_size)

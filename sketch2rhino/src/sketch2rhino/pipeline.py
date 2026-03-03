@@ -9,7 +9,7 @@ import numpy as np
 from scipy.interpolate import BSpline
 
 from sketch2rhino.brand import brand_signature
-from sketch2rhino.config import AppConfig
+from sketch2rhino.config import AppConfig, FitConfig, PathExtractConfig
 from sketch2rhino.debug.artifacts import (
     ensure_debug_dir,
     save_binary_png,
@@ -193,13 +193,25 @@ def _fit_geometry_for_segment(
     cfg: AppConfig,
 ) -> tuple[CurveGeometry, str]:
     mode = str(cfg.fit.geometry_mode).strip().lower()
-    if mode == "polyline_only":
-        return fit_open_polyline(polyline, cfg.fit), "polyline"
+    fit_cfg: FitConfig = cfg.fit
+
     if mode == "nurbs_only":
-        return fit_open_nurbs(polyline, cfg.fit, anchors=anchors), "nurbs"
-    if should_use_polyline_geometry(polyline, cfg.fit):
-        return fit_open_polyline(polyline, cfg.fit), "polyline"
-    return fit_open_nurbs(polyline, cfg.fit, anchors=anchors), "nurbs"
+        # Curve-only mode tends to overfit tiny jitter and produce too many control points.
+        fit_cfg = cfg.fit.model_copy(deep=True)
+        n_points = max(2, len(polyline.points))
+        soft_ratio = float(np.clip(float(fit_cfg.spline.nurbs_only_soft_cp_ratio), 0.1, 1.0))
+        soft_min = max(int(fit_cfg.degree) + 1, int(fit_cfg.spline.nurbs_only_soft_cp_min))
+        soft_cap = max(soft_min, int(round(float(n_points) * soft_ratio)))
+        fit_cfg.max_control_points = max(soft_min, min(int(fit_cfg.max_control_points), soft_cap))
+        fit_cfg.spline.smoothing = max(float(fit_cfg.spline.smoothing), float(fit_cfg.spline.nurbs_only_smoothing_floor))
+
+    if mode == "polyline_only":
+        return fit_open_polyline(polyline, fit_cfg), "polyline"
+    if mode == "nurbs_only":
+        return fit_open_nurbs(polyline, fit_cfg, anchors=anchors), "nurbs"
+    if should_use_polyline_geometry(polyline, fit_cfg):
+        return fit_open_polyline(polyline, fit_cfg), "polyline"
+    return fit_open_nurbs(polyline, fit_cfg, anchors=anchors), "nurbs"
 
 
 def _resolve_effective_segment_enable(cfg: AppConfig) -> tuple[bool, str]:
@@ -216,8 +228,10 @@ def _resolve_effective_path_filter(cfg: AppConfig) -> tuple[float, int, str]:
     if mode == "polyline_only":
         return 0.0, 0, "disabled_for_geometry_mode_polyline_only"
     if mode == "nurbs_only":
-        # Keep curve mode complete: avoid hard truncation and only trim tiny speckles.
-        return min(float(cfg.output.multi.min_length_px), 4.0), 0, "relaxed_for_geometry_mode_nurbs_only"
+        # Curve mode: keep most paths but suppress tiny noisy fragments.
+        base = float(cfg.output.multi.min_length_px)
+        min_len = max(6.0, min(base, 12.0))
+        return min_len, 0, "denoise_for_geometry_mode_nurbs_only"
     if mode == "mixed":
         # Mixed mode in multi-output should keep full recall; downstream segment filtering handles cleanup.
         return 0.0, 0, "disabled_for_geometry_mode_mixed"
@@ -243,31 +257,104 @@ def _enhance_binary_for_geometry_mode(binary: np.ndarray, geometry_mode: str) ->
         return binary
 
     mask_u8 = (binary.astype(np.uint8) > 0).astype(np.uint8) * 255
+    if int(np.count_nonzero(mask_u8)) == 0:
+        return np.zeros_like(binary, dtype=np.uint8)
 
-    if mode == "polyline_only":
-        # Straight mode: suppress speckles/noisy burrs while keeping long line continuity.
-        blurred = cv2.GaussianBlur(mask_u8, (3, 3), sigmaX=0.7)
-        _, thresh = cv2.threshold(blurred, 127, 255, cv2.THRESH_BINARY)
-        kernel = np.ones((3, 3), dtype=np.uint8)
-        opened = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel, iterations=1)
-        closed = cv2.morphologyEx(opened, cv2.MORPH_CLOSE, kernel, iterations=1)
-        return (closed > 0).astype(np.uint8)
+    ink_ratio = float(np.count_nonzero(mask_u8)) / float(mask_u8.size)
+    # Mode-specific bridging policy:
+    # - mixed: dense scenes avoid bridging to prevent false merges.
+    # - nurbs_only: keep at least one bridge pass to reduce curve breaks.
+    # - polyline_only: allow stronger bridging on sparse strokes.
+    if mode == "mixed":
+        iters = 0 if ink_ratio >= 0.03 else 1
+    elif mode == "nurbs_only":
+        iters = 2 if ink_ratio <= 0.01 else 1
+    else:
+        if ink_ratio >= 0.06:
+            iters = 1
+        elif ink_ratio >= 0.03:
+            iters = 1
+        else:
+            iters = 2
+    if iters <= 0:
+        return (mask_u8 > 0).astype(np.uint8)
+
+    # Keep enhancement conservative: preserve faint/thin strokes and bridge only tiny breaks.
+    kernel = np.ones((3, 3), dtype=np.uint8)
+    closed = cv2.morphologyEx(mask_u8, cv2.MORPH_CLOSE, kernel, iterations=iters)
+    enhanced = cv2.bitwise_or(mask_u8, closed)
+    return (enhanced > 0).astype(np.uint8)
+
+
+def _adaptive_spur_min_length(binary: np.ndarray, requested: int, geometry_mode: str = "mixed") -> int:
+    base = max(0, int(requested))
+    if base <= 0:
+        return 0
+
+    ink_ratio = float(np.count_nonzero(binary > 0)) / float(binary.size)
+    mode = str(geometry_mode).strip().lower()
 
     if mode == "nurbs_only":
-        # Curve mode: favor continuous, cleaner strokes before skeletonization.
-        blurred = cv2.GaussianBlur(mask_u8, (3, 3), sigmaX=1.0)
-        _, thresh = cv2.threshold(blurred, 127, 255, cv2.THRESH_BINARY)
-        denoised = cv2.medianBlur(thresh, 3)
-        kernel = np.ones((3, 3), dtype=np.uint8)
-        closed = cv2.morphologyEx(denoised, cv2.MORPH_CLOSE, kernel, iterations=1)
-        return (closed > 0).astype(np.uint8)
+        # Curve mode: prune spur noise more aggressively to reduce tiny stray curves.
+        if ink_ratio <= 0.01:
+            return min(base, 6)
+        if ink_ratio <= 0.02:
+            return min(base, 8)
+        if ink_ratio <= 0.05:
+            return min(base, 10)
+        return base
 
-    # Mixed mode: light smoothing to reduce skeleton jaggies while keeping topology.
-    blurred = cv2.GaussianBlur(mask_u8, (3, 3), sigmaX=0.8)
-    _, thresh = cv2.threshold(blurred, 127, 255, cv2.THRESH_BINARY)
-    kernel = np.ones((3, 3), dtype=np.uint8)
-    closed = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel, iterations=1)
-    return (closed > 0).astype(np.uint8)
+    # Thin/light sketches tend to fragment into short branches; pruning too hard removes real strokes.
+    if ink_ratio <= 0.01:
+        return min(base, 3)
+    if ink_ratio <= 0.02:
+        return min(base, 5)
+    if ink_ratio <= 0.05:
+        return min(base, 8)
+    return base
+
+
+def _resolve_effective_path_extract_config(
+    cfg: AppConfig,
+    binary: np.ndarray,
+    geometry_mode: str,
+) -> tuple[PathExtractConfig, dict[str, object]]:
+    path_cfg = cfg.path_extract.model_copy(deep=True)
+    mode = str(geometry_mode).strip().lower()
+    ink_ratio = float(np.count_nonzero(binary > 0)) / float(binary.size)
+    changes: dict[str, object] = {
+        "ink_ratio": float(ink_ratio),
+        "dense_mode_adjustment": False,
+    }
+
+    # Dense scenes are prone to false junction fusion. Tighten only in mixed mode.
+    if mode == "mixed" and ink_ratio >= 0.02:
+        old_radius = float(path_cfg.cluster_radius_px)
+        new_radius = min(old_radius, 2.2 if ink_ratio < 0.05 else 1.8)
+        path_cfg.cluster_radius_px = float(new_radius)
+        changes["cluster_radius_px"] = float(new_radius)
+        changes["dense_mode_adjustment"] = True
+
+        old_bridge = float(path_cfg.junction_bridge_max_px)
+        new_bridge = min(old_bridge, max(3.0, float(new_radius) * 2.0))
+        path_cfg.junction_bridge_max_px = float(new_bridge)
+        changes["junction_bridge_max_px"] = float(new_bridge)
+
+        path_cfg.tangent_k = max(4, min(int(path_cfg.tangent_k), 8))
+        changes["tangent_k"] = int(path_cfg.tangent_k)
+
+        if str(path_cfg.crossing_policy).strip().lower() == "overpass":
+            path_cfg.crossing_policy = "junction_split"
+            changes["crossing_policy"] = "junction_split"
+
+    if mode == "nurbs_only":
+        # Curve mode prefers continuity: keep default crossing behavior and avoid tiny internal fragments.
+        old_internal = float(path_cfg.internal_path_min_length_px)
+        new_internal = max(old_internal, 3.0)
+        path_cfg.internal_path_min_length_px = float(new_internal)
+        changes["internal_path_min_length_px"] = float(new_internal)
+
+    return path_cfg, changes
 
 
 def _points_to_pixel_path(points_xy: list[tuple[float, float]], shape: tuple[int, int]) -> list[tuple[int, int]]:
@@ -468,15 +555,27 @@ def run_pipeline(
     segment_cfg_effective = cfg.fit.segment.model_copy(deep=True)
     simplify_cfg_effective = cfg.fit.simplify.model_copy(deep=True)
     if geometry_mode == "mixed":
-        # Mixed mode focuses on geometry recall/fidelity:
-        # avoid operations that can shift lines away from the traced skeleton.
-        segment_cfg_effective.pre_simplify_enable = True
-        segment_cfg_effective.pre_simplify_epsilon_px = 0.35
-        simplify_cfg_effective.epsilon_px = 0.0
-        segment_cfg_effective.endpoint_snap_tolerance_px = 1e-6
+        # Mixed mode balances recall with output editability.
+        if bool(segment_cfg_effective.pre_simplify_enable):
+            segment_cfg_effective.pre_simplify_epsilon_px = max(
+                0.50,
+                float(segment_cfg_effective.pre_simplify_epsilon_px),
+            )
+        simplify_cfg_effective.epsilon_px = max(0.65, float(simplify_cfg_effective.epsilon_px))
+        segment_cfg_effective.break_merge_distance_px = max(
+            3.0,
+            float(segment_cfg_effective.break_merge_distance_px),
+        )
         segment_cfg_effective.join_enable = True
-        segment_cfg_effective.join_angle_tolerance_deg = max(float(segment_cfg_effective.join_angle_tolerance_deg), 179.0)
-        segment_cfg_effective.post_join_smooth_enable = False
+        segment_cfg_effective.join_angle_tolerance_deg = max(
+            9.0,
+            float(segment_cfg_effective.join_angle_tolerance_deg),
+        )
+        segment_cfg_effective.post_join_smooth_enable = True
+        segment_cfg_effective.post_join_smooth_window = max(
+            3,
+            min(int(segment_cfg_effective.post_join_smooth_window), 3),
+        )
     report["mixed_fidelity_profile"] = {
         "active": geometry_mode == "mixed",
         "pre_simplify_enable": bool(segment_cfg_effective.pre_simplify_enable),
@@ -495,14 +594,22 @@ def run_pipeline(
     t1 = perf_counter()
     binary = preprocess_image(gray, cfg.preprocess)
     binary = _enhance_binary_for_geometry_mode(binary, geometry_mode)
+    path_extract_cfg_effective, path_extract_effective_report = _resolve_effective_path_extract_config(
+        cfg,
+        binary,
+        geometry_mode,
+    )
+    report["path_extract_effective"] = path_extract_effective_report
     report["timings"]["preprocess"] = perf_counter() - t1
     _report_progress(0.10, "preprocess")
 
     t2 = perf_counter()
     skeleton_cfg = cfg.skeleton.model_copy(deep=True)
-    if geometry_mode == "mixed":
-        # Mixed mode: prune short burrs a bit more aggressively for smoother skeleton overlays.
-        skeleton_cfg.spur_min_length_px = max(int(skeleton_cfg.spur_min_length_px), 22)
+    skeleton_cfg.spur_min_length_px = _adaptive_spur_min_length(
+        binary,
+        int(skeleton_cfg.spur_min_length_px),
+        geometry_mode=geometry_mode,
+    )
     skeleton = skeletonize_image(binary, skeleton_cfg)
     report["timings"]["skeletonize"] = perf_counter() - t2
     _report_progress(0.18, "skeletonize")
@@ -514,11 +621,14 @@ def run_pipeline(
 
     component_choice, component_choice_reason = _resolve_effective_component_choice(cfg)
     report["component_choice"] = {
-        "requested": str(cfg.path_extract.choose_component),
+        "requested": str(path_extract_cfg_effective.choose_component),
         "effective": component_choice,
         "reason": component_choice_reason,
     }
-    if component_choice_reason == "forced_all_for_geometry_mode_mixed" and str(cfg.path_extract.choose_component).strip().lower() != "all":
+    if (
+        component_choice_reason == "forced_all_for_geometry_mode_mixed"
+        and str(path_extract_cfg_effective.choose_component).strip().lower() != "all"
+    ):
         report["warnings"].append("path_extract.choose_component forced to all in mixed mode")
 
     if mode == "single":
@@ -540,7 +650,7 @@ def run_pipeline(
     raw_path_candidates: list[Polyline2D] = []
 
     if mode == "single":
-        polylines.append(extract_main_open_path(components[0], graphs[0], cfg.path_extract))
+        polylines.append(extract_main_open_path(components[0], graphs[0], path_extract_cfg_effective))
         raw_path_candidates = list(polylines)
         _report_progress(0.40, "extract_paths")
     else:
@@ -549,7 +659,7 @@ def run_pipeline(
                 extract_open_paths(
                     skeleton=comp,
                     graph=graph,
-                    cfg=cfg.path_extract,
+                    cfg=path_extract_cfg_effective,
                     min_length_px=0.0,
                     max_curves=None,
                     include_loops=cfg.output.multi.include_loops,
@@ -596,7 +706,7 @@ def run_pipeline(
     junctions_xy: list[tuple[float, float]] = []
     if mode == "multi" and cfg.output.multi.preserve_junctions and len(polylines) >= 2:
         for graph in graphs:
-            junctions_xy.extend(extract_junction_centers(graph, cfg.path_extract))
+            junctions_xy.extend(extract_junction_centers(graph, path_extract_cfg_effective))
         polylines, protected_points = _snap_and_collect_protected_points(
             polylines=polylines,
             junctions_xy=junctions_xy,
@@ -767,6 +877,23 @@ def run_pipeline(
             segment_polylines = smoothed_polylines
             segment_anchors = smoothed_anchors
             join_stats["post_join_smoothed"] = True
+
+        if float(simplify_cfg_effective.epsilon_px) > 0.0 and segment_polylines:
+            # Join/smooth can introduce local point density; run one more simplify pass.
+            resimplified_polylines: list[Polyline2D] = []
+            resimplified_anchors: list[list[tuple[float, float]]] = []
+            for i, seg in enumerate(segment_polylines):
+                protected = segment_anchors[i] if i < len(segment_anchors) else None
+                simplified = simplify_polyline(
+                    seg,
+                    simplify_cfg_effective,
+                    protected_points=protected,
+                )
+                resimplified_polylines.append(simplified)
+                resimplified_anchors.append(_polyline_anchor_points(simplified, protected))
+                _report_loop_progress(0.84, 0.02, i, len(segment_polylines), "post_join_resimplify")
+            segment_polylines = resimplified_polylines
+            segment_anchors = resimplified_anchors
         _report_progress(0.84, "post_join_smooth")
     else:
         for i, polyline in enumerate(stabilized_list):
