@@ -157,6 +157,15 @@ class ExportConfig(BaseModel):
     layer_name: str = "sketch_curve"
     object_name: str = "main_nurbs"
     multi_object_prefix: str = "stroke"
+    file_version: int = 7
+
+    @field_validator("file_version")
+    @classmethod
+    def _validate_file_version(cls, value: int) -> int:
+        version = int(value)
+        if version not in {6, 7, 8}:
+            raise ValueError("export.file_version must be one of: 6, 7, 8")
+        return version
 
 
 class MultiOutputConfig(BaseModel):

@@ -181,7 +181,7 @@ def write_3dm_many(
             attr.SetUserString(f"behop.{key}", value)
         model.Objects.AddCurve(curve, attr)
 
-    ok = model.Write(str(out), 8)
+    ok = model.Write(str(out), int(cfg.file_version))
     if not ok:
         raise RuntimeError(f"Failed to write 3dm file: {out}")
 

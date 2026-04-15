@@ -107,6 +107,7 @@ export:
   layer_name: "sketch_curve"
   object_name: "main_nurbs"
   multi_object_prefix: "stroke"
+  file_version: 7   # Rhino 7/8 compatible
 
 output:
   mode: "multi"   # "single" or "multi"
